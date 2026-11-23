@@ -1422,7 +1422,8 @@ void fg_register() {
              std::to_string(S.n_views2.load()) + ",\"frames_per_eye_mono\":" + std::to_string(S.n_views2_mono.load()) +
              ",\"size\":\"" + std::to_string(S.w) + "x" + std::to_string(S.h) + "\"" +
              ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
-             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() + "}";
+             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() +
+             ",\"hud\":" + metrics_json() + "}";
     }
     if (sub == "latency") {
       std::string what = a.size() > 1 ? a[1] : "";

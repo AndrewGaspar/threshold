@@ -3,7 +3,12 @@
 #include <windows.h>
 
 #include <atomic>
+#include <cstdio>
+#include <cstring>
+#include <mutex>
+#include <string>
 
+#include "core/log.h"
 #include "core/quiver.h"
 
 namespace th::fg {
@@ -22,6 +27,13 @@ struct M {
   // renderer thread
   int64_t last = 0;
   uint64_t last_real = 0, last_gen = 0;
+  // what was last published (fg status "hud", and a log line when the state or multiplier changes)
+  std::mutex mu;
+  std::string p_state;
+  unsigned p_mult = 0;
+  double p_real = 0, p_gen = 0;
+  int p_reflex = 0;
+  uint64_t p_dropped = 0, p_ticks = 0;
 } g;
 
 int64_t qpc(int64_t us) { return us * g.qpc_freq / 1000000; }
@@ -86,7 +98,10 @@ void metrics_present(char kind, int64_t arrive_us, int64_t call_us, int64_t ret_
 }
 
 void metrics_dropped(unsigned n) {
-  if (g.on && n) quiver_count(quiver_sdk(), g.dropped, n);
+  if (!g.on || !n) return;
+  quiver_count(quiver_sdk(), g.dropped, n);
+  std::lock_guard lk(g.mu);
+  g.p_dropped += n;
 }
 
 void metrics_resize() {
@@ -105,13 +120,30 @@ void metrics_tick(int64_t now, const char* state, unsigned mult, int (*reflex)()
   if (dt < 500000) return;
   const uint64_t r = g.n_real.load(std::memory_order_relaxed), n = g.n_gen.load(std::memory_order_relaxed);
   quiver_mod* q = quiver_sdk();
+  const double real_fps = double(r - g.last_real) * 1e6 / double(dt), gen_fps = double(n - g.last_gen) * 1e6 / double(dt);
+  const int rm = reflex ? reflex() : 0;
   ::quiver_state(q, g.state, state);
   ::quiver_gauge(q, g.mult, mult);
-  ::quiver_gauge(q, g.real, double(r - g.last_real) * 1e6 / double(dt));
-  ::quiver_gauge(q, g.gen, double(n - g.last_gen) * 1e6 / double(dt));
-  const int rm = reflex ? reflex() : 0;
+  ::quiver_gauge(q, g.real, real_fps);
+  ::quiver_gauge(q, g.gen, gen_fps);
   ::quiver_state(q, g.reflex, rm == 2 ? "boost" : rm == 1 ? "on" : "off");
   g.last = now, g.last_real = r, g.last_gen = n;
+  std::lock_guard lk(g.mu);
+  if (g.p_state != state || g.p_mult != mult)
+    TH_LOG("fg: HUD: %s, %ux (%.0f rendered + %.0f generated fps)", state, mult, real_fps, gen_fps);
+  g.p_state = state, g.p_mult = mult, g.p_real = real_fps, g.p_gen = gen_fps, g.p_reflex = rm, g.p_ticks++;
+}
+
+std::string metrics_json() {
+  std::lock_guard lk(g.mu);
+  if (!g.on) return "null";
+  char b[256];
+  snprintf(b, sizeof b,
+           "{\"state\":\"%s\",\"multiplier\":%u,\"real_fps\":%.1f,\"generated_fps\":%.1f,\"dropped\":%llu,"
+           "\"reflex\":%d,\"published\":%llu}",
+           g.p_state.c_str(), g.p_mult, g.p_real, g.p_gen, (unsigned long long)g.p_dropped, g.p_reflex,
+           (unsigned long long)g.p_ticks);
+  return b;
 }
 
 }  // namespace th::fg

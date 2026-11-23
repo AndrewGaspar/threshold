@@ -4,6 +4,7 @@
 // frames, injected Reflex, and (once Quiver offers mod rings) a record per present. Only with
 // [fg] enabled: without it nothing is declared or sent.
 #include <cstdint>
+#include <string>
 
 namespace th::fg {
 
@@ -18,5 +19,7 @@ void metrics_resize();             // the swapchain's buffers go: a new present 
 // state: "off" | "on" | "auto" | "idle" | "failed"; mult: presents per rendered frame now (1 = none);
 // reflex() (called only when publishing): 0 off, 1 on, 2 boost (applied).
 void metrics_tick(int64_t now, const char* state, unsigned mult, int (*reflex)());
+// What was last published, for `fg status` ("hud"); null when FG is off or Quiver isn't there.
+std::string metrics_json();
 
 }  // namespace th::fg
