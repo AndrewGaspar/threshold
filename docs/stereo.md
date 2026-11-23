@@ -432,6 +432,19 @@ R(n−1) to R(n).
   3840x1080 and `end` squeezed them into 1920 halves of a 3840 swapchain): features at the half's
   width (1920), depth/MVs whole; ratios 0.497 / 0.499 and 0.473 / 0.475, disparity G / real −5.95 /
   −5.66 and −6.04 / −5.81 px. No HUD-less in hsbs (the side-by-side texture is 2W, the frame W).
+- **Level changes with 3D + FG** (r10, SDR, RT off; `re/scripts/stereo_rb_fg_levels.sh`, run twice in the
+  same session): 4x, 6 teleports (mail-room, executive-corridor, cafeteria, motel, dead-letters,
+  entry-lobby) and a checkpoint restart, then 2x and 2 teleports; 20 level changes in all.
+  - The FG features were created once per eye at start and never re-created or released (`CreateFeature(FrameGeneration` 2 in the log, 0 evaluate errors, `fail 0 dropped 0` after every
+    change); pairs advanced throughout (9764 → 72325), multiplier 4.0 / 2.0 after each change.
+  - Right after each change (the first jobs, `fg grab 2`, player idle): generated vs real of the same
+    eye ≤ 1.08/255, vs the other eye ≥ 1.70/255 (dead-letters, a dark room; elsewhere 3.9-10.1),
+    disparity of generated frames equal to the real frames' (median |diff| ≤ 0.02 px). Screenshots
+    after every change: both eyes correct, HUD in both.
+  - No Xid from this run. One `signaller_worker` timeout in its game.log at 07:42:20, one second
+    before an `Xid 109` (07:42:21) of pid 899329, which was the other lab instance's game
+    (`control-stereo` r42, RT on: 56 timeouts, relaunched at 07:45; this run's game was pid 1054272
+    throughout). The second pass (07:47-07:53) added no timeout and no Xid.
 - **Each alone is unchanged** (same build, r6/r7):
   - FG off, `mode = sbs`, `output = full` (r6): 22721 pairs, HUD in both halves, image-shift
     convergence ∓12 px as before (screenshot: the black seam columns), `fg status` enabled false, no
@@ -492,8 +505,8 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 
 ## Open issues
 
-- **Stereo + FG** (works, measured above): not tested with RT on (the RT fault below comes first),
-  through a level change, or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
+- **Stereo + FG** (works, measured above, including 20 level changes): not tested with RT on (the RT
+  fault below comes first) or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
   rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
 - **GPU fault in 3D play with ray tracing** (MMU fault, one shader, minutes into play; mono is fine):
@@ -735,15 +748,15 @@ waits never satisfied as `STUCK`.
 
 - **State.** Implemented and measured (section "Stereo with frame generation"). Lab instance
   `control-sfg` on rayblaster (display 3840x1080@120, left with `display.hdr=on` and renderer.ini
-  `m_eAllowHDR 1` from the HDR run, RT off, DLSS on) is down. Its first launch writes renderer.ini;
+  `m_eAllowHDR 0`, SDR display, RT off, DLSS Quality 1280x720 → 1920x1080) is down. Its first launch writes renderer.ini;
   edit it in `~/Games/quiver-lab/instances/control-sfg/install/` while the game isn't running.
 - **Drive.** `tools/lab/moddir OUT fg.enabled=1 stereo.mode=sbs stereo.output=full fg.count=2`, then
   `Q="quiver --machine rayblaster" tools/fg/launch control-sfg OUT` (into the lobby, cinematics
   skipped), `tools/fg/stereo-grab control-sfg DIR TAG [jobs] [spin_dx]` (grab + analysis), and for
   pacing `tools/fg/fg-series` run on rayblaster from a synced copy (`~/threshold-sfg`, not
   `~/threshold-lab`, which another session's `rb-sync --delete` owns).
-- **Next.** RT on once the RT fault is fixed; a level change (teleport) with FG on in 3D; latency
-  (`tools/fg/latency`) in 3D.
+- **Next.** RT on once the RT fault is fixed; latency (`tools/fg/latency`) in 3D. Level changes:
+  `re/scripts/stereo_rb_fg_levels.sh OUT` on a running `control-sfg` (passed, r10).
 
 ## Reproducing
 

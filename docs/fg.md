@@ -444,7 +444,7 @@ installed with `enabled = 1`.
 - HDR: the trace can't decode FP16 bands; HUD-less in HDR assumes `copyWithGamma` is the identity for
   scRGB as well (measured equal outside the HUD, 6).
 - Stereo + FG (section 10; measurements in docs/stereo.md "Stereo with frame generation", 2x/4x, SDR
-  and HDR, hsbs smoke-tested): not tested with RT on, across level changes, or for latency.
+  and HDR, hsbs smoke-tested, 20 level changes passed): not tested with RT on or for latency.
 
 ## Resume notes: stereo (2026-11-23, branch `wip/stereo-fg`)
 
