@@ -540,7 +540,7 @@ std::atomic<double> g_blas_avg{8.0};
 // r41), and dropping their builds left BLASes unbuilt while the TLAS used them (the in-world RT fault,
 // r20-r40). 8 = the same for compaction entries: off by default, running them hung the first teleport
 // (r41: Xid 109).
-std::atomic<int> g_as_once{5};
+std::atomic<int> g_as_once{21};  // 16 when its hooks are in (r50-r51), else 5 with load_mono
 std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0}, g_n_as_new{0}, g_n_as_new_built{0};
 // The job runs on a worker thread, possibly after the render thread has moved on to the right eye, so
 // the eye is the job's order within the pair (reset when the pair starts), not g_vis_phase at run time.
@@ -593,12 +593,12 @@ void __fastcall hk_asJob(void** cap) {
   if (k == 0 && g_vis_phase.load() == 2) g_n_as_late++;  // the left eye's job ran after the right eye began
   if (k == 2) g_n_as_extra++;                           // a third job in one pair (not expected)
   int m = g_as_once.load();
-  if (m & 16) {
+  if ((m & 16) && o_rtUpdate && o_buildTlas) {
     if (k == 0) {
       g_n_left_builds += n;
       g_n_left_compactions += cnt(0x68);
     }
-    if (k != 1 || !o_buildTlas) return o_asJob(cap);
+    if (k != 1) return o_asJob(cap);
     uint32_t inst = cnt(0x78);  // > 0 gates the refit/build/compaction/record work in the job
     cnt(0x78) = 0;
     t_tlas_skip = true;
@@ -658,8 +658,9 @@ void __fastcall hk_asJob(void** cap) {
 // A level change keeps the frame mono until the engine is done (signals above) and then until no
 // new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
 constexpr uint64_t kSettleMs = 3000, kChangeMaxMs = 90000;
+bool as_shared() { return (g_as_once.load() & 16) && o_rtUpdate && o_buildTlas; }
 bool level_changing() {
-  if (!g_load_mono.load()) return false;
+  if (!g_load_mono.load() || as_shared()) return false;  // with shared AS, level changes stay in 3D
   uint64_t now = GetTickCount64();
   bool busy = false;
   if (void* jp = g_lc_jp.load()) {
@@ -1277,7 +1278,7 @@ void stereo_register() {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
     } else if (id == "stereo.as_once") {
-      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 5 : atoi(v.c_str());
+      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 21 : atoi(v.c_str());
     } else if (id == "stereo.video_once") {
       g_video_once = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.load_mono") {

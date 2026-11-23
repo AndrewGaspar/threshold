@@ -1,9 +1,9 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r45, RT reflections):
-> the right eye's acceleration-structure job now runs the BLAS builds that only it has
-> (`as_once = 5`), and the frame is mono during level changes until streaming settles
-> (`load_mono = 1`: the loading screen plus ~3 s, up to 25 s or more in busy areas). See "Level-change hang". All
+> **Status:** 3D runs with all ray-tracing effects on and stays 3D through level changes: the right
+> eye shares the left eye's acceleration structures (`as_once` 16, rayblaster r50/r51: 10 min in the
+> world, 15+ teleports, a checkpoint restart, with and without 4x FG, no GPU fault). See "Shared
+> acceleration structures" and, for the history, "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
 > both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
 > per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
@@ -525,8 +525,8 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
 | dev: `history_mask` | 63 | per-eye sets: 1 graph persisted list, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring, 32 the RT reflection filter's output history (only with 2). All on: measured best (r38) |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
-| dev: `as_once` | 5 | mask: 1 the right eye's AS job skips the build/compaction entries the left eye's job ran in this pair; 4 it still runs the build entries only it has (without 4 they were dropped: the in-world RT fault); 8 also the compaction entries only it has (hung a teleport, off); 2 also skips its dynamic-BLAS refit list; 0 runs everything twice. The right eye's job is the pair's second, by order (the job runs on a worker thread) |
-| dev: `load_mono` | 1 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
+| dev: `as_once` | 21 | mask: **16 the right eye shares the left eye's acceleration structures** ("Shared acceleration structures": its RT scene update and AS work are skipped; level changes stay in 3D); without 16 (or if its hooks don't match): 1 the right eye's AS job skips the build/compaction entries the left eye's job ran in this pair, 4 it still runs the build entries only it has, 8 also those compactions, 2 also skips its refit list; 0 runs everything twice. The right eye's job is the pair's second, by order |
+| dev: `load_mono` | 1 (inert with `as_once` 16) | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
@@ -543,21 +543,9 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
   r48): not tested on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
   rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
-- **2D after a level change.** Measured from the logs (r45, r47: `nav: lab state` and `stereo: level
-  change settled`): the loading screen itself is ~6-9 s (no world renders then anyway); after it,
-  3D resumes ~3 s later in some places (mail-room, motel, entry-lobby), but in others (cafeteria,
-  dead-letters) the BLAS-build bursts go on for more than the soak's ~25 s dwell, which is where the
-  "30-40 s" came from (those settles span two teleports). Hypothesis, not tested (shortening the
-  window risks the level-change hang): the burst threshold (2x the lobby's average + 8 builds per
-  job) is relative to the lobby, so a busier area's steady streaming reads as a burst. Next: log the
-  per-job build counts through a tail (no risk: `load_mono` stays on) to tell a decaying load burst
-  from that area's steady rate, then make the threshold follow the new area's rate.
-- **Why the right eye's new BLAS builds hang during a level change** (Xid 109, r41/r42) is not
-  known; `load_mono` keeps those frames mono instead (2D through the load and ~3-25+ s after it). Suspect:
-  BLAS storage is allocated on worker jobs ("rtd:Threaded resource allocation", static
-  renderer+0x151570 `RaytracingStaticMeshStorage`) and an entry that enters the lists between the
-  eyes may be built before its allocation has finished. `mode = left` faulted once in r33 (one
-  render, moved camera); not explained by this fix and not re-tested.
+- **Shared acceleration structures (`as_once` 16):** the right eye traces the left eye's TLAS, culled
+  with the left eye's view volume (plus the engine's culling expansion); a difference at the frustum
+  edges in reflections was not measured (screenshots only). Frame-time effect not measured.
 - **HDR HUD brightness / paper white** were not compared to mono (only presence in both eyes).
 - **Exclusive fullscreen with `output = full`** stalls at the title (also without the window code):
   use borderless or windowed.
@@ -567,6 +555,79 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
   update's. Lens-flare occlusion queries and other GPU-side per-render state were not checked.
 - No pass-2 shortcuts (shadow maps, probes reused by the second eye): sbs costs a full second
   world render. Same-update vs frame-sequential under a pan (`test_pan`) was not measured.
+
+## Shared acceleration structures (`as_once` bit 16): 3D through level changes
+
+The right eye no longer has ray-tracing scene work of its own. It traces against the acceleration
+structures, instance records and shader table that the left eye's update built in the same game
+update (same pose, same objects). New objects are listed and built by the next left update through
+the engine's own path, so they appear one frame later, in both eyes at once. `load_mono` is then not
+needed.
+
+**How the engine does it (static, renderer/d3d, Ghidra).**
+- The RT object is `renderer-internal+0x220` (one for both eyes). Scene update (renderer+0x123d60)
+  ticks its render counter RT+0xd8 and runs the RT scene update renderer+0xa81b0 (inline, or as a job
+  it waits for before `RenderInstanceManager::end`). At the end it launches the AS job
+  renderer+0xa89c0 (handle 0x90e9e8), which the RT pass (renderer+0xa8bf0) waits for and whose
+  command list it executes between the graphics/async-compute fences.
+- renderer+0xa81b0 **empties every list** of the RT object (counts +0x18, +0x28 refit, +0x38, +0x48 and
+  +0x58 builds, +0x68 compactions, +0x78 instances, +0x88 per-geometry records, +0x98) and refills
+  them for this render: the RT render-instance query with the eye's view volume (expanded by "rtd:
+  Culling view expansion"), per instance renderer+0xa8ce0 appends a D3D12 instance desc (+0x70,
+  hit-group base = running geometry count x 2, BLAS address from the BLAS object) and per geometry a
+  0x40-byte record (+0x80) and material (+0x90); then it sizes the TLAS buffers (+0xc0 result, +0xc8
+  scratch) and copies the instance descs into +0xb8 (a staging buffer: copied on the graphics list).
+  So the shader-table records and the TLAS's hit-group indices come from the same render's lists.
+- Static-mesh BLASes go through a per-object state machine (renderer+0x150cc0, state at +0xac), stepped
+  from renderer+0xa81b0 with the render counter: 0 → listed for build (+0x40), stamped with the
+  counter, its post-build-info slot = its list position; 1 → exactly two renders later reads the
+  compacted size from readback[counter & 1] (copied by the AS job of the build render) and allocates
+  compacted storage (a worker job when "rtd:Threaded resource allocation"); 2 → when that allocation's
+  ready flag is set, listed for compaction (+0x60); 3 → one render later frees the uncompacted storage
+  and uses the compacted one, without checking that the compaction ran.
+- Skinned BLASes (renderer+0xa6600 / +0xa6c00) refit only when the object was seen at the previous
+  counter value (+0x78 + 1); +0x74 "built" is set by the build itself.
+- d3d's `buildTopLevelAccelerationStructure` (0x336e0) only records the build (instance descs +0xb8,
+  dest +0xc0, scratch +0xc8): no other state. The TLAS buffer is one buffer, not a ring.
+
+**What that means for two renders per update.** The right eye's update stamped and listed objects
+with the right eye's counter and list positions, so skipping or deferring its entries (as_once 1 and
+5) left the state machine believing in builds or compactions that never ran: as_once 1 dropped builds
+(the in-world fault, r20-r40), and as_once 5 still drops right-eye compactions, after which state 3
+switches the object to compacted storage that was never written (static reading; no fault was seen
+from it in r41-r48, possibly because fresh compacted storage reads as an empty BLAS). Carrying entries over to the next
+left job would also carry the right eye's stamps and post-build slots (another object's slot in the
+left list). And the right eye's own TLAS and shader table are built from its own culling, so its
+records cannot be mixed with the left eye's TLAS.
+
+**Bit 16.** For the right eye of a pair:
+- renderer+0xa81b0 is skipped (hook) and the counter tick undone, so the RT object keeps the left
+  eye's lists, instance descs (+0xb8) and per-geometry records (the right eye's shader table is the
+  left's), and every state machine steps once per update with the left eye's stamps and slots (as in
+  mono: compacted sizes are read two updates after the build, skinned refits stay consecutive).
+- Its AS job runs with the instance count at 0, which skips the refit, build, compaction and record
+  work inside it (all behind `count > 0`), and its TLAS build is dropped (hook on the d3d export,
+  armed on that job's thread only). The job still records its (empty) list, so the fences and the RT
+  pass run as before. The right eye's rays use +0xc0, the left eye's TLAS.
+- Nothing is marked built without being built: objects are only ever listed by left updates.
+Counters in `stereo status`: `rt_upd_skipped`, `tlas_skipped` (one each per pair), `left_builds`,
+`left_compactions`. There is no explicit carry-over list to count: an object the right eye's update
+would have listed is simply listed by the next left update (the engine re-lists every render).
+Default `as_once = 21` (16, falling back to 5 with `load_mono` if the RT scene update or the d3d
+export doesn't match); with 16 active, `load_mono` is inert.
+
+**Verified (rayblaster, all RT effects on, sbs, `as_once = 16`, `load_mono = 0`, watchdog armed):**
+
+| run | test | result |
+|---|---|---|
+| r50 | 10 min in the world, then 15 teleports in 434 s (mail-room, executive-corridor, cafeteria, motel, dead-letters, entry-lobby, cycling), then cafeteria, dead-letters and a checkpoint restart with screenshots 1, 5 and 15 s after each (`re/scripts/stereo_rb_lcshots.sh`) | **no Xid, no `signaller_worker` timeout**; every world render a pair (`worlds` = `pairs` + 1, `mono_fallback` 0, `load_mono` 0): 3D throughout every level change's tail; both eyes correct in the screenshots; `rt_upd_skipped` = `tlas_skipped` = pairs (111815) |
+| r51 | the same with `[fg] enabled = 1`, `count = 4`: 5 min in the world, 7 teleports, dead-letters and a restart with screenshots | **no Xid, no timeout**; FG `fail 0` in every perf line, `frames_per_eye_mono` 0 (FG stayed per eye through the level changes); both eyes correct |
+
+Compared with `load_mono` (r43-r47), where the frame was 2D through each tail (in cafeteria and
+dead-letters for 25 s and more), the pairs now advance through every teleport step (~2000 pairs
+per 25 s step). Not measured: the cost or benefit in frame time of skipping the right eye's RT
+update and AS work (expected to save CPU and GPU time, as nothing RT-related runs twice now).
+
 
 ## Level-change hang (`as_once`) and the open in-world RT fault
 
