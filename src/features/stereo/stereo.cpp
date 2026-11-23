@@ -533,15 +533,22 @@ std::atomic<double> g_blas_avg{8.0};
 // level-change use-after-free (compaction frees the source BLAS). stereo.as_once = 0 runs them twice.
 // stereo.as_once is a mask: 1 = builds + compaction (above); 2 = also the dynamic-BLAS refit list
 // (+0x20, count +0x28: same pose for both eyes in one update, so the right eye's refit is redundant).
+// 4 = run only the right eye's entries the left eye's job did not run in this pair (by entry pointer):
+// an object can enter the lists between the two eyes (streaming finishes at any time), and skipping
+// its build left it unbuilt for this update.
 std::atomic<int> g_as_once{1};
-std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0};
+std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0}, g_n_as_new{0};
 // The job runs on a worker thread, possibly after the render thread has moved on to the right eye, so
 // the eye is the job's order within the pair (reset when the pair starts), not g_vis_phase at run time.
 std::atomic<int> g_as_pair_jobs{2};
+// The left eye's build (+0x40, +0x50) and compaction (+0x60) entries of this pair, sorted.
+constexpr size_t kAsLists[3] = {0x40, 0x50, 0x60};
+std::vector<void*> g_as_left[3];
 void __fastcall hk_asJob(void** cap) {
   uint8_t* sc = cap && *cap ? static_cast<uint8_t*>(*cap) : nullptr;
   if (!sc) return o_asJob(cap);
   auto cnt = [&](size_t off) -> uint32_t& { return *reinterpret_cast<uint32_t*>(sc + off); };
+  auto arr = [&](size_t off) -> void**& { return *reinterpret_cast<void***>(sc + off); };
   uint32_t n = cnt(0x48) + cnt(0x58);
   g_n_blas_builds += n;
   // Dynamic objects get BLAS builds every render (~7 per render in the lobby, live r17), so streaming
@@ -553,20 +560,51 @@ void __fastcall hk_asJob(void** cap) {
   if (k == 0 && g_vis_phase.load() == 2) g_n_as_late++;  // the left eye's job ran after the right eye began
   if (k == 2) g_n_as_extra++;                           // a third job in one pair (not expected)
   int m = g_as_once.load();
+  if (k == 0 && (m & 1)) {  // the left eye's entries, for the right eye's comparison
+    for (int l = 0; l < 3; l++) {
+      auto& v = g_as_left[l];
+      v.assign(arr(kAsLists[l]), arr(kAsLists[l]) + (arr(kAsLists[l]) ? cnt(kAsLists[l] + 8) : 0));
+      std::sort(v.begin(), v.end());
+    }
+  }
   if (!(m & 2) && !(m & 1 && (n || cnt(0x68)))) return o_asJob(cap);
   if (!m || k != 1) return o_asJob(cap);
-  const size_t offs[4] = {0x48, 0x58, 0x68, 0x28};
-  uint32_t save[4] = {};
-  for (int i = 0; i < 4; i++) {
-    if (!(m & (i < 3 ? 1 : 2))) continue;
-    save[i] = cnt(offs[i]);
-    cnt(offs[i]) = 0;
+  // Build/compaction lists: the right eye's entries not run by the left eye (kept with bit 4).
+  void** sarr[3] = {};
+  uint32_t scnt[3] = {};
+  std::vector<void*> keep[3];
+  bool swapped[3] = {};
+  if (m & 1)
+    for (int l = 0; l < 3; l++) {
+      size_t o = kAsLists[l];
+      uint32_t c = cnt(o + 8);
+      if (!c || !arr(o)) continue;
+      for (uint32_t j = 0; j < c; j++)
+        if (!std::binary_search(g_as_left[l].begin(), g_as_left[l].end(), arr(o)[j])) keep[l].push_back(arr(o)[j]);
+      g_n_as_new += keep[l].size();
+      g_n_as_skipped += c - ((m & 4) ? keep[l].size() : 0);
+      sarr[l] = arr(o), scnt[l] = c, swapped[l] = true;
+      if (m & 4) {
+        arr(o) = keep[l].data();
+        cnt(o + 8) = uint32_t(keep[l].size());
+      } else {
+        cnt(o + 8) = 0;
+      }
+    }
+  uint32_t refit = 0;
+  if (m & 2) {
+    refit = cnt(0x28);
+    cnt(0x28) = 0;
+    g_n_refit_skipped += refit;
   }
-  g_n_as_skipped += save[0] + save[1] + save[2];
-  g_n_refit_skipped += save[3];
   o_asJob(cap);
-  for (int i = 0; i < 4; i++)
-    if (save[i] && cnt(offs[i]) == 0) cnt(offs[i]) = save[i];  // the engine clears them itself later
+  for (int l = 0; l < 3; l++) {
+    if (!swapped[l]) continue;
+    size_t o = kAsLists[l];
+    arr(o) = sarr[l];
+    if (cnt(o + 8) == 0 || cnt(o + 8) == keep[l].size()) cnt(o + 8) = scnt[l];  // the engine clears them later
+  }
+  if (refit && cnt(0x28) == 0) cnt(0x28) = refit;
 }
 // A level change keeps the frame mono until the engine is done (signals above) and then until no
 // new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
@@ -1017,7 +1055,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1025,7 +1063,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
