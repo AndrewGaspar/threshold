@@ -66,3 +66,12 @@ tweak), and choose M or L with Quiver's DLSS Super Resolution model tweak.
 |---|---|---|
 | `legacy_model` | 0 | written to renderer.ini before the game reads it; 0 = the game asks for K |
 | `ray_reconstruction` | 0 | 1 lets the game create RR (crashes with the game's NULL inputs) |
+
+## HUD metrics
+
+`dlss.cpp` reports the upscaler to Quiver's Sight (`threshold.upscaler`, `threshold.res.internal`,
+docs/fg.md section 11): `DLSS <mode> <preset>` (the preset the game hints for that mode; a DRS
+override can replace it, and Quiver's own NGX-log row shows the one used) and the SR feature's render
+size, at each SR feature creation. Once the game has released every SR feature (a `ReleaseFeature`
+hook), the upscaler reads `off` and the resolution `native`. Live on rayblaster 2026-11-23: `DLSS DLAA F`
+with the legacy model and `DLSS DLAA K` without, `1920×1080`. The `off` path is static only.

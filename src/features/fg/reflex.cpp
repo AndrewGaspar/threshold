@@ -175,6 +175,11 @@ void reflex_present_end(ID3D12Device* dev) {
   }
 }
 
+int reflex_applied() {
+  std::lock_guard lk(R.m);
+  return R.sleeping ? R.applied : 0;
+}
+
 std::string reflex_status_json() {
   std::lock_guard lk(R.m);
   char b[200];

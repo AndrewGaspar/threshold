@@ -30,6 +30,7 @@
 #include "features/fg/engine.h"
 #include "features/fg/hdr.h"
 #include "features/fg/latency.h"
+#include "features/fg/metrics.h"
 #include "features/fg/reflex.h"
 #include "features/fg/trace.h"
 
@@ -808,6 +809,7 @@ void present_tex(ID3D12Resource* src, const Job& j, char kind, int gi, int gn, i
   present_real(S.sc, j.sync, j.flags);
   S.last_present_us = now_us();
   trace_ret(ti, S.pring.fence, v);
+  metrics_present(kind, j.arrive_us, S.last_call_us, S.last_present_us);
 }
 
 void sleep_until(int64_t t) {
@@ -849,7 +851,10 @@ void present_thread() {
     }
     unsigned shown_gen = 0;
     int64_t prev_call = 0, prev_ret = 0;
-    if (behind && j.n_gen) S.p_skip += j.n_gen;
+    if (behind && j.n_gen) {
+      S.p_skip += j.n_gen;
+      metrics_dropped(j.n_gen);
+    }
     if (!behind && j.n_gen && (S.show == State::kAll || S.show == State::kGenerated)) {
       // DLSS-G finished? Don't wait longer than 100 ms (then this job's generated frames are dropped).
       if (fence_wait(S.rring.fence, j.eval_v, ev, 100)) {
@@ -876,6 +881,7 @@ void present_thread() {
         S.p_gen += shown_gen;
       } else {
         ++S.p_drop;
+        metrics_dropped(j.n_gen);
       }
     }
     if (S.show != State::kGenerated || !shown_gen) {
@@ -1250,6 +1256,9 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   ++S.frame;
   perf();
   auto_step(t);
+  // HUD metrics (metrics.cpp): this frame's state and multiplier.
+  metrics_tick(t, n_gen ? (S.count_auto ? "auto" : "on") : !want ? "off" : !have_in ? "idle" : "failed", n_gen + 1,
+               reflex_applied);
   limit(n_gen > 0);
   // Reflex (reflex.cpp): the driver's sleep before the next frame starts, after our cap. Counted with
   // the limiter's sleep as time the frame didn't work.
@@ -1332,6 +1341,7 @@ void before_resize(IDXGISwapChain* sc) {
     st.in[0].ok = st.in[1].ok = false;
   }
   S.reset = true;
+  metrics_resize();
   TH_LOG("fg: resize: released proxies and generated-frame textures");
 }
 
@@ -1412,7 +1422,8 @@ void fg_register() {
              std::to_string(S.n_views2.load()) + ",\"frames_per_eye_mono\":" + std::to_string(S.n_views2_mono.load()) +
              ",\"size\":\"" + std::to_string(S.w) + "x" + std::to_string(S.h) + "\"" +
              ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
-             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() + "}";
+             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() +
+             ",\"hud\":" + metrics_json() + "}";
     }
     if (sub == "latency") {
       std::string what = a.size() > 1 ? a[1] : "";
@@ -1488,6 +1499,7 @@ void fg_start() {
   present_getbuffer(getbuffer);
   present_takeover(takeover);
   present_before_resize(before_resize);
+  metrics_init();
   TH_LOG("fg: enabled (count %u)", S.count.load());
 }
 
