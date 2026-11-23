@@ -1,6 +1,7 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Branches:** on `main`, `[stereo] rt_async_build` defaults to 1 (the engine's own setting: no
+> **This branch (wip/stereo-hdr-level-change)** defaults `rt_async_build` to 0: the HDR level-change hang
+> fix is on, untested. On `main`, `[stereo] rt_async_build` defaults to 1 (the engine's own setting: no
 > level-change hang in SDR on rayblaster). The HDR level-change hang fix (hold the async build off while pairs
 > render) is on branch `wip/stereo-hdr-level-change`, untested (resume notes under "Level-change hang").
 
