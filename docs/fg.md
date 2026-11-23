@@ -8,7 +8,7 @@
 > Resume notes at the end.
 
 Control has no frame generation. Threshold adds it through NGX directly (no Streamline), on the
-game's own D3D12 device, queue and NGX instance. Code: `src/features/fg/`: `fg.cpp` (inputs,
+game's own D3D12 device, queue and NGX instance. Code: `src/features/fg/`: `metrics.cpp` (Quiver HUD metrics, section 11), `fg.cpp` (inputs,
 evaluation, present thread, pacing, limiter, `count = auto`), `engine.cpp` (camera and HUD-less taps
 on the renderer), `trace.cpp` (the present trace), `common.h`. Tools: `tools/fg/`. Static
 background: [`re/dlss.md`](../re/dlss.md) sections 2–3, [`re/stereo.md`](../re/stereo.md) 2.3–2.4.
@@ -400,6 +400,87 @@ frame generation" has the measurements):
 - `fg grab N TAG` / `fg grab files`: the real and generated frames of the next N jobs, whole, as
   THRW `.raw` in the run folder (`tools/fg/stereo-grab`, `tools/fg/stereo-gen.py`).
 
+### 11. HUD metrics (Quiver's Sight, rayblaster r1–r5 of `control-hud`, 2026-11-23)
+
+Quiver's HUD gets its frame-generation numbers in two ways (Quiver `design/SIGHT-HUD.md` 3.4,
+3.17, and quiverd's `perf/layout.rs`, `perf/hud.rs`, read 2026-11-23):
+
+- **Generic** (`fps.base`, `fg.ratio`, the "79 → 158" / "FG 2.0×" of the Standard and Compact
+  presets): only from Quiver's implementation-agnostic sources. The Sight layer counts application
+  frames from the game's `VK_NV_low_latency2` sleeps (Reflex) and presents per frame. **A mod can't
+  fill these roles** (quiverd records the claim as a conflict). Threshold's own DLSS-G presents
+  are counted correctly there **only with `[fg] reflex = on`**: one `NvAPI_D3D_Sleep` per rendered
+  frame reaches the layer as `vkLatencySleepNV` through dxvk-nvapi and vkd3d-proton. Measured
+  from the layer's status block (`tools/fg/sight-count.py`, 2 s windows):
+
+  | run | config | layer: presents/s | app frames/s | presents per frame | Threshold: rendered fps |
+  |---|---|---|---|---|---|
+  | r3 | mono 2x, reflex on | 279.0 | 139.5 | 2.00 | 139.9 |
+  | r3 | mono 4x, reflex on | 507.5 | 127.0 | 4.00 | 137.5 |
+  | r3 | mono 4x, reflex **off** | 544.0 | 0 | none (no sleeps or markers: flags 0x81) | 129.2 |
+  | r4 | stereo sbs 4x, reflex on | 219.0 | 55.0 | 3.98 | 54.6 |
+
+  With Reflex off (the default, section 9) the layer has nothing that delimits a rendered frame,
+  so the HUD shows presented FPS only. That is what the user saw.
+- **Threshold's own metrics** (`threshold.*`, `metrics.cpp`, and `dlss.cpp` for the upscaler),
+  over the Quiver mod SDK (`quiver_metric_declare`, `quiver_gauge`/`quiver_state`/`quiver_text`/
+  `quiver_count`). Sight shows them in its panel and in the HUD's **Full** preset as Threshold's mod
+  strip: basic gauges, states and texts in `order`, at most six. The strip should read roughly
+  `THRESHOLD FG on · 4× · BASE 137 FPS · GEN 406 FPS · SR DLSS DLAA K · 1920×1080`. That is a
+  reading of quiverd's code: it has not been seen on screen (gap 2 below).
+
+| metric | kind | level | value, source |
+|---|---|---|---|
+| `fg.state` | state | basic | `on`; `auto` (on, `count = auto`); `idle` ("no input": menus, videos, the game's DLSS off); `off` (`active = 0` or count 1); `failed` (inputs but no generated frame). From the game Present just handled |
+| `fg.multiplier` | gauge `x` | basic | presents per rendered frame now (generated + 1 of the latest frame), 1 without generation. Follows `count = auto` |
+| `fps.real`, `fps.generated` | gauge `fps` | basic | our real and generated Presents per second over 0.5 s (present thread): **frames, not DLSS-G features**, so stereo's two evaluations per generated frame count once |
+| `fg.dropped` | counter | advanced | generated frames not shown (not done in 100 ms, or superseded) |
+| `reflex.mode` | state | advanced | injected Reflex as applied (`off` / `on` / `boost`) |
+| `frame` | frame | advanced | one record per Present (`QUIVER_FRAME_GENERATED` / `REAL` / `REAL\|NOFG`, game Present, our call and return in QPC). **Refused by this Quiver** (no mod rings yet); submitted only while `quiver_perf_wanted()`, which is 0 until then, so it costs nothing now |
+| `upscaler` | text | basic | `DLSS <mode> <preset>` from the game's SR `CreateFeature` (`PerfQualityValue` and the preset hint for that mode, e.g. `DLSS DLAA K`); `off` once every SR feature is released (`ReleaseFeature` hook, signature `48 89 5c 24 08 57 48 83 ec 20 48 8b 1d`) |
+| `res.internal` | text | basic | the SR feature's `Width`×`Height` (one eye's with stereo) |
+
+Values go out at 2 Hz from the renderer thread (end of the game's Present, after `auto_step`), and
+the SDK coalesces them. With `[fg] enabled = 0` none of the FG metrics is declared, and nothing is
+counted or sent per frame. Only the upscaler's two texts exist then, set at feature creation.
+Descriptors are sent in full at runtime: quiverd doesn't merge a version's `[metric.*]` tables into
+a runtime declaration (it validates each declaration alone, and a state needs its `values`). The
+TOML repeats them for the catalog and `options lint`. `fg status` has a `hud` object with what was
+last published, and the log says `fg: HUD: <state>, <N>x (...)` on each change.
+
+Live (lab instance `control-hud` on rayblaster, the game's DLSS at DLAA; the lab's own mod SDK endpoint):
+
+- Declarations: `quiver SDK: metrics accepted: upscaler res.internal fg.state fg.multiplier fps.real
+  fps.generated fg.dropped reflex.mode; refused: frame` (r2–r4), and only `upscaler res.internal`
+  with FG off (r5).
+- Published values (`fg status` `hud` against the 2 s perf line). Mono 2x: on, 2x, 153.2 + 151.2
+  fps. 4x: on, 4x, 134.5 + 403.6 (perf 136.5 rendered, 545.9 presents/s). `active = 0`: off, 1x,
+  149.9 + 0. Stereo sbs (r4, two DLSS-G and two SR features): 2x 66.0 + 66.0 (perf 133.0
+  presents/s), 4x 55.4 + 166.2 (perf 221.6, x4.00).
+- `count = auto` (`target_hz` 0 → 120 Hz, then 240, 480): the state reads `auto` and the multiplier
+  follows every step within ~0.3 s, e.g. `fg: count auto 3x -> 4x` at 192.229 s, then `fg: HUD:
+  auto, 4x (131 rendered + 328 generated fps)` at 192.519 s.
+- Upscaler: `DLSS DLAA F` (the legacy model, before rsettings had a renderer.ini to edit, r2), then
+  `DLSS DLAA K`, `1920×1080`; in stereo sbs (r4) also `1920×1080`, one eye's size. The `off`
+  path (DLSS turned off in the game's menu) was not exercised live.
+
+**Gaps on Quiver's side** (evidence above; for the Quiver session):
+
+1. **No base FPS or FG multiplier on the HUD without Reflex.** The generic roles take only the
+   layer's Reflex counting, so a mod that generates frames itself with Reflex off gets "FPS" and
+   nothing else. Threshold knows exactly which present is real or generated. The SDK's `frame`
+   kind (`QUIVER_FRAME_REAL` / `GENERATED`) was meant for that (SIGHT-HUD 3.15), but quiverd refuses
+   it ("frame metrics need a shared-memory ring, which this Quiver doesn't offer yet",
+   `quiver-core/src/modsdk.rs` `add_metric`), and `quiver_frame_submit` in `quiver_mod.h` 3.0 drops
+   every record. Threshold submits records as soon as `quiver_perf_wanted()` says a consumer wants
+   them.
+2. **A lab instance can't show mod metrics.** The lab's `quiver-sight --lab` has no quiverd: its
+   HUD model is the layer's FPS / frame time / 1% low only, its presets are `fps`, `compact` and
+   `standard` (no Full, so no mod strip), and the lab's mod SDK endpoint records declarations
+   (`runs/rN/sdk.json`) but not values. `quiver perf sessions` lists no lab sessions. So the mod
+   strip could not be seen anywhere this agent may run the game. Its look is untested until a real
+   (non-lab) session.
+
 ## Options (`[fg]`)
 
 | key | default | |
@@ -423,6 +504,9 @@ frame generation" has the measurements):
 Needs the game's DLSS on (any quality including DLAA). HDR (FP16 scRGB swapchain) works through the PQ conversion (6).
 Menus, loading screens and the game's pre-rendered video cutscenes don't run DLSS, so they have no
 inputs and are presented as rendered (`no input` in the perf line); generation resumes in-world.
+
+HUD metrics for Quiver's Sight (`threshold.fg.state`, `fg.multiplier`, `fps.real`, `fps.generated`, ...)
+are section 11. Sight's own base FPS and FG multiplier need `reflex = on`.
 
 Perf line (every 2 s): real + generated presents/s, multiplier, count (`auto`), the cap, the real
 interval, when DLSS-G finished after the game's Present, how often and how long the game waited for

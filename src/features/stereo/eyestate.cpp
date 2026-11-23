@@ -10,6 +10,7 @@
 #include <vector>
 
 #include "core/config.h"
+#include "core/hook.h"
 #include "core/log.h"
 #include "features/stereo/engine.h"
 #include "core/present.h"
@@ -77,8 +78,37 @@ void view_leave(void* r, int eye) {
 std::atomic<uint64_t> g_n_tile_holds{0};
 int g_saved_count = 0;
 bool g_tile_held = false;
+// stereo.tile_hold: how the left eye keeps objects' previous transforms for the right eye.
+// 1 = the whole left render is a non-final high-res-screenshot tile (count = index + 1). That also
+//     skipped the "Ambient Probe" pass (renderer+0x211c80, runs only when index == count) in the left
+//     eye, which left its forward-lit transparents and particles unlit (car glass, blowing leaves;
+//     live, rayblaster r52 photo mode).
+// 2 = the hold only around the Cleanup pass (renderer+0x134040), the one other reader of the count:
+//     prev transforms as before, the probe runs in both eyes (default).
+// 0 = no hold (the left eye advances the previous transforms; the right eye then sees no motion).
+std::atomic<int> g_tile_hold{2};
+using Pass_t = void(__fastcall*)(void*, void*, void*, void*);
+Pass_t o_cleanup;
+std::atomic<bool> g_left_tile{false};
+std::atomic<uint64_t> g_n_cleanup_holds{0};
+void __fastcall hk_cleanup(void* a, void* b, void* c, void* d) {
+  if (!g_left_tile.load(std::memory_order_relaxed)) return o_cleanup(a, b, c, d);
+  int& idx = *reinterpret_cast<int*>(g_rimg.at(kRvaTileIndex));
+  int& cnt = *reinterpret_cast<int*>(g_rimg.at(kRvaTileCount));
+  if (idx != cnt) return o_cleanup(a, b, c, d);  // a real high-res screenshot
+  int saved = cnt;
+  cnt = idx + 1;
+  g_n_cleanup_holds++;
+  o_cleanup(a, b, c, d);
+  cnt = saved;
+}
 void tile_enter(int eye) {
-  if (eye != 0 || !g_data_ok) return;
+  if (eye != 0 || !g_data_ok || !g_tile_hold.load()) return;
+  if (g_tile_hold.load() == 2 && o_cleanup) {
+    g_left_tile = true;
+    g_n_tile_holds++;
+    return;
+  }
   int& idx = *reinterpret_cast<int*>(g_rimg.at(kRvaTileIndex));
   int& cnt = *reinterpret_cast<int*>(g_rimg.at(kRvaTileCount));
   if (idx != cnt) return;  // a real high-res screenshot is running: leave it alone
@@ -88,6 +118,7 @@ void tile_enter(int eye) {
   g_n_tile_holds++;
 }
 void tile_leave() {
+  g_left_tile = false;
   if (!g_tile_held) return;
   *reinterpret_cast<int*>(g_rimg.at(kRvaTileCount)) = g_saved_count;
   g_tile_held = false;
@@ -492,6 +523,7 @@ void eyestate_register() {
   cfg_listen("stereo.history_mask", [](const std::string&, const std::string& v) {
     g_hist_mask = v.empty() ? 63 : atoi(v.c_str());
   });
+  cfg_listen("stereo.tile_hold", [](const std::string&, const std::string& v) { g_tile_hold = v.empty() ? 2 : atoi(v.c_str()); });
   cfg_listen("stereo.graph_cross", [](const std::string&, const std::string& v) { g_graph_cross = atoi(v.c_str()); });
   cfg_listen("stereo.dlss_per_eye", [](const std::string&, const std::string& v) {
     g_dlss_per_eye = (v == "0" || v == "false" || v == "off") ? 0 : 1;
@@ -507,6 +539,11 @@ void eyestate_start(const Image& renderer) {
     return;
   }
   g_free_tex = reinterpret_cast<RtFree_t>(module_export(kRenderer, kExpRtFree, "stereo"));
+  if (void* cl = reinterpret_cast<void*>(g_rimg.at(0x134040));
+      sig_match(cl, "41 56 48 83 ec 30 48 c7 44 24 20 fe ff ff ff 48 89 5c 24 40 48 89 6c 24 48"))
+    hook_fn(cl, (void*)hk_cleanup, (void**)&o_cleanup, "render graph Cleanup pass (stereo: previous transforms held for the right eye)");
+  else
+    TH_LOG("stereo: Cleanup pass not matched: tile_hold 2 falls back to 1");
   g_copy_region = reinterpret_cast<CopyRegion_t>(module_export(kD3D, kExpCopyRegion, "stereo"));
   if (g_copy_region && !sig_match((void*)g_copy_region, kSigCopyRegion)) g_copy_region = nullptr;
   g_free_depth = reinterpret_cast<RtFree_t>(module_export(kRenderer, kExpRtFreeDepth, "stereo"));
@@ -563,9 +600,9 @@ void eyestate_mono(void*) {
 std::string eyestate_status() {
   char b[768];
   snprintf(b, sizeof b,
-           "{\"per_eye\":%d,\"view_swaps\":%llu,\"tile_holds\":%llu,\"hist_swaps\":%llu,\"graph_flush\":%llu,\"dlss\":{\"per_eye\":%d,\"on\":%s,\"right\":\"%p\","
+           "{\"per_eye\":%d,\"view_swaps\":%llu,\"tile_holds\":%llu,\"cleanup_holds\":%llu,\"hist_swaps\":%llu,\"graph_flush\":%llu,\"dlss\":{\"per_eye\":%d,\"on\":%s,\"right\":\"%p\","
            "\"swaps\":%llu,\"created\":%llu,\"released\":%llu,\"failed\":%llu,\"pending\":%zu,\"err\":\"0x%08x\",\"reset_replay\":%llu}}",
-           g_per_eye.load(), (unsigned long long)g_n_view_swaps.load(), (unsigned long long)g_n_tile_holds.load(),
+           g_per_eye.load(), (unsigned long long)g_n_view_swaps.load(), (unsigned long long)g_n_tile_holds.load(), (unsigned long long)g_n_cleanup_holds.load(),
            (unsigned long long)g_n_hist_swaps.load(), (unsigned long long)g_n_graph_flush.load(),
            g_dlss_per_eye.load(), g_dlss_enabled && *g_dlss_enabled ? "true" : "false", g_rf.handle,
            (unsigned long long)g_n_dlss_swaps.load(), (unsigned long long)g_n_dlss_created.load(),

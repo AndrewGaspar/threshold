@@ -274,3 +274,115 @@ help = "On: each eye has its own DLSS history (sharp, no blending between eyes).
 default = true
 level = "advanced"
 apply = "live"
+
+# ---------------------------------------------------------------- metrics (Quiver design/SIGHT-HUD.md 3)
+# Threshold's own metrics (threshold.*), shown in Sight's panel and the HUD's Full preset (its mod strip:
+# basic gauges, states and texts, by `order`). The mod declares the same descriptors at runtime
+# (src/features/fg/metrics.cpp, src/features/dlss.cpp): keep them together. Generic roles (fps.base,
+# fg.ratio, upscaler, render.resolution) are Quiver's agnostic sources only, so none are claimed.
+# The fg.* / fps.* / reflex.mode / frame metrics exist only with [fg] enabled.
+
+[metric."fg.state"]
+kind = "state"
+label = "Frame Generation"
+short = "FG"
+help = "Threshold's DLSS Frame Generation: on, on with count = auto, no input (menus, videos, the game's DLSS off), off, or failed."
+values = [
+  { value = "off", label = "off", level = "dim" },
+  { value = "on", label = "on" },
+  { value = "auto", label = "auto" },
+  { value = "idle", label = "no input", level = "dim" },
+  { value = "failed", label = "failed", level = "bad" },
+]
+display = "badge"
+group = "Frame generation"
+order = 1
+level = "basic"
+
+[metric."fg.multiplier"]
+kind = "gauge"
+label = "FG multiplier"
+help = "Presents per rendered frame now ([fg] count, or what count = auto chose); 1 while no frames are generated."
+unit = "x"
+format = { precision = 0 }
+sample = 2
+group = "Frame generation"
+order = 2
+level = "basic"
+
+[metric."fps.real"]
+kind = "gauge"
+label = "Rendered FPS"
+short = "BASE"
+help = "Frames the game rendered per second (each shown once, after its generated frames)."
+unit = "fps"
+format = { precision = 0 }
+better = "higher"
+sample = 2
+group = "Frame generation"
+order = 3
+level = "basic"
+
+[metric."fps.generated"]
+kind = "gauge"
+label = "Generated FPS"
+short = "GEN"
+help = "DLSS-G frames presented per second."
+unit = "fps"
+format = { precision = 0 }
+sample = 2
+group = "Frame generation"
+order = 4
+level = "basic"
+
+[metric."fg.dropped"]
+kind = "counter"
+label = "Generated frames dropped"
+help = "Generated frames not shown: DLSS-G wasn't done within 100 ms, or the next frame was already waiting."
+unit = "count"
+better = "lower"
+group = "Frame generation"
+order = 6
+level = "advanced"
+
+[metric."reflex.mode"]
+kind = "state"
+label = "Reflex (injected)"
+short = "RFX"
+values = [
+  { value = "off", label = "off", level = "dim" },
+  { value = "on", label = "on" },
+  { value = "boost", label = "boost" },
+]
+display = "badge"
+group = "Latency"
+order = 7
+level = "advanced"
+
+[metric.frame]
+kind = "frame"
+label = "FG presents"
+help = "One record per Present Threshold makes: generated, real after generated, or real alone."
+clock = "qpc"
+key = "present_seq"
+fields = ["game_present", "present_call", "present_return"]
+sample = "per-frame"
+group = "Frame generation"
+level = "advanced"
+
+[metric.upscaler]
+kind = "text"
+label = "Upscaler"
+short = "SR"
+help = "The game's DLSS Super Resolution: its quality mode and the preset the game asks for (a driver override can replace it), or off."
+group = "Upscaling"
+order = 10
+level = "basic"
+
+[metric."res.internal"]
+kind = "text"
+label = "Internal resolution"
+help = "The size the game renders at before DLSS upscales it (one eye's in stereo 3D)."
+group = "Upscaling"
+order = 11
+level = "basic"

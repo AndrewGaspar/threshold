@@ -145,7 +145,7 @@ The left eye uses the engine's own state, the right eye a second set swapped in 
 | state | what | how |
 |---|---|---|
 | previous camera (camera motion vectors, `g_m*Previous*`) | main `rend::View` +0x3d0/+0x450/+0x4b0 | each eye's current matrices kept after its render and put back before its next one (static: `storePrevious` 0x180700 from `end`) |
-| object previous transforms (object motion vectors) | Cleanup pass copies Object +0x70 → +0xa0 only when the high-res-screenshot tile index == count (`renderer+0x802978/7c`) | the left eye renders as a non-final tile (count = index + 1): both eyes see last update's transforms; the right eye advances them. The ambient probe, guarded the same way, updates once (right eye) |
+| object previous transforms (object motion vectors) | Cleanup pass copies Object +0x70 → +0xa0 only when the high-res-screenshot tile index == count (`renderer+0x802978/7c`) | inside the left eye's Cleanup pass only, the count is index + 1 (a non-final tile; `tile_hold = 2`, hook on renderer+0x134040): both eyes see last update's transforms; the right eye advances them. The ambient probe (renderer+0x211c80, the count's only other reader) runs in both eyes; holding the count for the whole left render (`tile_hold = 1`, before) skipped it there and left the left eye's forward-lit transparents and particles unlit (below, "Left eye: unlit glass and leaves") |
 | DLSS history | `DLSSData+0x28/+0x30` (d3d `0x111be0`) | a second NGX feature created from the engine's own create parameters (sizes, quality, flags, preset hints) through the game's exported NGX entry points, swapped in for the right eye; re-created when the engine's feature changes, released 3 presents after its last use |
 | RT denoiser (DLF) histories | 4 globals `renderer+0x90eac8, 0x912b18, 0x910b98, 0x90eb98`, and the reflection filter's output history `0x912b20` (bit 32, paired with `0x912b18`) | pointer swap (the filters allocate on null; static) |
 | SSR / AO / sun-shadow temporal | `rend::SSAO` (r+0xd8) ping-pong pairs +0x100..+0x138 | pointer swap; its prepare allocates the right eye's |
@@ -656,12 +656,44 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
   use borderless or windowed.
 - **HypXRland end to end** (window tag applied, `auto` resolving to sbs/hsbs) is untested here: the
   lab has no Hyprland. The code path is TB's (core/hyprland.cpp, shared).
-- The ambient probe is computed once per update (by the right eye); the left eye uses last
-  update's. Lens-flare occlusion queries and other GPU-side per-render state were not checked.
+- The ambient probe now runs in both eyes' renders (twice per update), so its own temporal
+  smoothing, if it has any, advances twice as fast; not measured. Lens-flare occlusion queries and other GPU-side per-render state were not checked.
 - No pass-2 shortcuts (shadow maps, probes reused by the second eye): sbs costs a full second
   world render. Same-update vs frame-sequential under a pan (`test_pan`) was not measured.
 
-## Shared acceleration structures (`as_once` bit 16): 3D through level changes
+## Left eye: unlit glass and leaves (fixed, `tile_hold = 2`)
+
+Reported from play on a HypXRland display (lobby, looking out to the street): car windows differed
+between the eyes, and the leaves blowing on the pavement looked as if at screen depth.
+
+**Measured (rayblaster r52/r53, all RT effects, lobby turned to the street, frozen in Photo Mode;
+`re/scripts/stereo_rb_street.sh` then `stereo_ab.sh`; each eye against its own mono reference
+`mode = left` / `right`, which match `mode = off`):**
+- With the old hold (`tile_hold = 1`) the **left** eye was the wrong one: its car and shop-window
+  glass rendered darker than both mono references and the right eye, and the leaves were black
+  (unlit) instead of lit yellow-green. The right eye matched its reference. A leaf lit in one eye
+  only cannot be fused, which reads as "at the screen". `as_once` 16 vs 5 made no difference (r52),
+  and neither did the history swaps (`history_mask` 62, 0); `per_eye = 0` (no hold) had both eyes
+  like mono, which pointed at the per-eye state.
+- Cause (static, renderer): the hold set the high-res-screenshot tile count to index + 1 for the
+  whole left render, so it could keep objects' previous transforms for the right eye (the Cleanup
+  pass, renderer+0x134040, copies them only when index == count). The count has one other reader,
+  the "Ambient Probe" pass (renderer+0x211c80), which then skipped in the left eye, and the forward
+  lighting of transparents and particles in that render had no probe.
+- Fix: `tile_hold = 2` (default) holds the count only inside the Cleanup pass. Same previous
+  transforms as before (`cleanup_holds` ≈ `tile_holds` in `stereo status` eyestate).
+
+| left eye vs monoL (r53) | old (`tile_hold = 1`) | fixed (`2`) |
+|---|---|---|
+| mean \|diff\| over the pixels the old left eye got wrong (5972 px: glass, leaves; /255) | 33.8 | 8.6 |
+| 99.9th percentile \|diff\|, whole eye | 34.7 | 17.3 (the rest is the reference's Photo Mode depth of field, which had not settled in the first capture) |
+| lit leaves found (colour mask, y 450-900) L / R | 0 / 4 | 4 / 4 |
+| leaf disparity L−R, median | – (no left-eye match) | 8.65 px, equal to the mono pair's 8.65 px |
+
+So the right eye's darker-looking car glass in play was the correct one; after the fix both eyes
+look like the right eye did (and like mono).
+
+ (`as_once` bit 16): 3D through level changes
 
 The right eye no longer has ray-tracing scene work of its own. It traces against the acceleration
 structures, instance records and shader table that the left eye's update built in the same game
