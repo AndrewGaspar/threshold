@@ -418,7 +418,11 @@ put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bi
 - Both eyes are correct afterwards, HUD in both (screenshot).
 Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
 
-**The SDR re-check** (run r19, shipped defaults): see below.
+**SDR re-check (run r19, the branch's shipped defaults).** 6/6 teleports with 3D on throughout
+(pairs 1392 → 3012). Then a checkpoint restart: the game kept presenting (present 31399 → 34590)
+while the restart played back to the game start, with no world renders yet when the run ended. One
+`signaller_worker` timeout in game.log, no Xid. Before the fix, SDR had passed r2 (6 + restart)
+while HDR hung every time, so the fault was rarer in SDR (fewer or later compactions), not HDR-only.
 
 `load_mono` (dev, default 0 now): renders mono while the engine changes level, then until streaming
 settles. It was the stop-gap before the cause was found. r17: with it on, 6 teleports + restart passed
