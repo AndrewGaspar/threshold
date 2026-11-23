@@ -1,0 +1,32 @@
+#!/usr/bin/env bash
+# tools/fg/stereo-grab INSTANCE OUT TAG [jobs] [spin_dx]: on a running game with frame generation, grab
+# the real and generated frames of `jobs` consecutive jobs (`fg grab`, whole frames as .raw), optionally
+# while the camera turns (tools/fg/spin.py, spin_dx px of mouse-look every 2 ms; 0 = still), copy them
+# to OUT and run tools/fg/stereo-gen.py. Q (env) is the quiver command (default: rayblaster's lab,
+# whose run folder is read over SSH, RB_HOST).
+set -euo pipefail
+inst=$1 out=$2 tag=$3 jobs=${4:-3} dx=${5:-0}
+here=$(cd "$(dirname "$0")/../.." && pwd)
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:stereo-fg}
+Q=${Q:-quiver --machine rayblaster}
+host=${RB_HOST:-rayblaster}
+mkdir -p "$out"
+if (( dx != 0 )); then
+  $Q lab exec "$inst" -- python3 -c "$(cat "$here/tools/fg/spin.py")" 6 "$dx" 2 >/dev/null 2>&1 &
+  spin=$!
+  python3 -I -c 'import time; time.sleep(2.5)'
+fi
+$Q lab call "$inst" fg grab "$jobs" "$tag" >/dev/null
+end=$((SECONDS + 30)) n=0
+until ((SECONDS > end)); do
+  n=$($Q lab call "$inst" fg grab files 2>/dev/null | python3 -I -c 'import json,sys; print(len(json.load(sys.stdin)))' 2>/dev/null || echo 0)
+  ((n >= jobs * 2)) && break
+  python3 -I -c 'import time; time.sleep(0.5)'
+done
+python3 -I -c 'import time; time.sleep(1)'
+[[ -n ${spin:-} ]] && wait "$spin" || true
+run=$(ssh -o BatchMode=yes "$host" "ls -td \$HOME/Games/quiver-lab/instances/$inst/lab/runs/r* | head -1")
+rsync -a "$host:$run/fggrab_*_${tag}_*.raw" "$out/"
+ssh -o BatchMode=yes "$host" "rm -f $run/fggrab_*_${tag}_*.raw"
+echo "$(ls "$out"/fggrab_*_"${tag}"_*.raw | wc -l) files in $out ($run)"
+python3 -I "$here/tools/fg/stereo-gen.py" "$out" --tag "$tag" --json "$out/$tag.json"
