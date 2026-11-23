@@ -395,7 +395,7 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 - No pass-2 shortcuts (shadow maps, probes reused by the second eye): sbs costs a full second
   world render. Same-update vs frame-sequential under a pan (`test_pan`) was not measured.
 
-## Level-change hang (fixed: `as_once`)
+## Level-change hang (`as_once`; a cinematic transition still hangs)
 
 **Cause.** Each world render's "Scene update" launches the ray-tracing acceleration-structure job
 (renderer+0xa89c0). It refits dynamic BLASes, builds BLASes for every object in its build lists
@@ -417,6 +417,15 @@ put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bi
 - No `signaller_worker` timeouts and no new Xid.
 - Both eyes are correct afterwards, HUD in both (screenshot).
 Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
+
+**Not fully fixed: a cinematic transition still hangs (rayblaster r20, r21, main's defaults, SDR).**
+Letting the opening cinematic play to its first transition (timeline ends, the next one starts and
+the server session stops ticking for a moment) hung the GPU (r21: `Xid 109` at 03:29:08, presents
+stopped ~0.3 s after the timeline switch at 432.5 s). r20 froze at the same point. r18/r19 skipped
+the cinematic before that transition. So `as_once` removed the double build/compaction, but a hazard
+remains at transitions. Suspect: the right eye's TLAS rebuild (async compute, in place) overlaps the
+left eye's rays still running on d3d's async raytrace queue, with no fence between those two queues.
+Under test: `as_once` + `rt_async_build = 0` (both async paths held off).
 
 **SDR re-check (run r19, the branch's shipped defaults).** 6/6 teleports with 3D on throughout
 (pairs 1392 → 3012). Then a checkpoint restart: the game kept presenting (present 31399 → 34590)

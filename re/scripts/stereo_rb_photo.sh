@@ -18,7 +18,9 @@ if ! q wait $i in-world --timeout 240 >/dev/null 2>&1; then
   q wait $i in-world --timeout 240 >/dev/null 2>&1
 fi
 q key $i space --hold 1500 >/dev/null
-for n in $(seq 1 15); do q key $i space >/dev/null; q shot $i /dev/null --settle 6 >/dev/null 2>&1; q where $i 2>/dev/null | grep -q '"control":true' && break; done
+# the opening cinematic: until the player is in control and no cinematic runs (up to ~6 min)
+for n in $(seq 1 40); do q where $i 2>/dev/null | grep -q '"control":true' && break; q key $i space >/dev/null; q shot $i /dev/null --settle 8 >/dev/null 2>&1; done
+q shot $i /dev/null --settle 10 >/dev/null 2>&1
 for n in $(seq 1 20); do
   q key $i Escape >/dev/null; q shot $i /dev/null --settle 3 >/dev/null 2>&1
   q where $i 2>/dev/null | grep -q '"menu":true' && break
