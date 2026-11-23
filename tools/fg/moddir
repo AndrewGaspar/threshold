@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# tools/fg/moddir OUT [section.key=value ...]: tools/lab/moddir for the fg build directory
+# (build-fg/mod): a mod copy with start-only settings (e.g. fg.enabled=1). Prints OUT.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+out=$1; shift
+rm -rf "$out"; cp -r "$root/build-fg/mod" "$out"
+for kv in "$@"; do
+  key=${kv%%=*}; val=${kv#*=}; sec=${key%%.*}; k=${key#*.}
+  python3 -I - "$out/threshold.ini" "$sec" "$k" "$val" <<'PY'
+import sys, re
+path, sec, key, val = sys.argv[1:]
+lines = open(path).read().split('\n'); cur = None; done = False; out = []
+for i, l in enumerate(lines):
+    m = re.match(r'\s*\[(.+)\]\s*$', l)
+    if m:
+        if cur == sec and not done: out.append(f'{key} = {val}'); done = True
+        cur = m.group(1)
+    elif cur == sec and re.match(rf'\s*{re.escape(key)}\s*=', l):
+        l = f'{key} = {val}'; done = True
+    out.append(l)
+if not done:
+    if cur != sec: out.append(f'[{sec}]')
+    out.append(f'{key} = {val}')
+open(path, 'w').write('\n'.join(out))
+PY
+done
+echo "$out"

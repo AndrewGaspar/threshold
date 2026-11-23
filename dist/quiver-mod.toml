@@ -1,0 +1,11 @@
+id = "threshold"
+name = "Threshold"
+version = "0.1.0"
+kind = "mod"
+description = "Stereoscopic 3D, DLSS Multi Frame Generation and current DLSS models for Control."
+save_compatible = true
+games = ["gog:2049187585"]
+
+# The mod is a dxgi.dll proxy in the game folder (it forwards to the system dxgi).
+[launch]
+dll = { dxgi = "n,b" }

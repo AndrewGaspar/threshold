@@ -1,0 +1,27 @@
+#!/usr/bin/env bash
+# scripts/dump-exports [GAME_DIR]: write re/exports/<dll>.txt (mangled export names) and .dem
+# (mangled<TAB>demangled) for every *_rmdwin10_f.dll of the installed game. The engine DLLs export
+# thousands of C++ symbols; grep these before opening Ghidra. Needs mingw objdump and llvm-undname.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+game=${1:-$HOME/Games/ubi-library/Control}
+mkdir -p "$root/re/exports"
+for f in "$game"/*_rmdwin10_f.dll; do
+  b=$(basename "$f" .dll)
+  x86_64-w64-mingw32-objdump -p "$f" | sed -n '/\[Ordinal\/Name Pointer\] Table/,/^$/p' | grep -E '^\s*\[' |
+    awk '{print $NF}' > "$root/re/exports/$b.txt"
+  python3 -I - "$root/re/exports/$b.txt" "$root/re/exports/$b.dem" <<'PY'
+import subprocess, sys
+names = [l.strip() for l in open(sys.argv[1]) if l.strip()]
+out = subprocess.run(['llvm-undname'], input='\n'.join(names) + '\n', capture_output=True, text=True).stdout
+# llvm-undname echoes each input line, then the result, then a blank line.
+lines = [l for l in out.split('\n')]
+res, i = [], 0
+for n in names:
+    while i < len(lines) and lines[i] != n: i += 1
+    d = lines[i + 1] if i + 1 < len(lines) and lines[i + 1] and not lines[i + 1].startswith('error') else n
+    res.append(f'{n}\t{d}'); i += 2
+open(sys.argv[2], 'w').write('\n'.join(res) + '\n')
+PY
+  echo "$b: $(wc -l < "$root/re/exports/$b.txt") exports"
+done

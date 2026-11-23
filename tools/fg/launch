@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# tools/fg/launch INSTANCE MODDIR: launch Control from the game-start fixture with MODDIR, drive the
+# menus (Return, Return, Escape, Return = Continue), skip the cinematics (nav `skip` verb) and wait
+# until the player has camera control. Runs where the instance is (tools/lab/rb on rayblaster).
+set -uo pipefail
+inst=$1 mod=$2
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-fg}
+quiver lab kill "$inst" >/dev/null 2>&1
+quiver lab fixture install "$inst" game-start >/dev/null 2>&1
+chmod -R u+w "$HOME/Games/quiver-lab/instances/$inst/prefix/drive_c/users/steamuser/Documents/My Games/Control/Saves"
+quiver lab launch "$inst" --mod "$mod" --wait frame --timeout 300 | tail -1
+for k in Return Return Escape Return; do
+  quiver lab shot "$inst" /dev/null --settle 4 >/dev/null 2>&1 || true
+  quiver lab key "$inst" "$k" >/dev/null
+done
+quiver lab call "$inst" skip for=120 >/dev/null 2>&1 || echo "no skip verb"
+end=$((SECONDS + 240))
+until quiver lab where "$inst" 2>/dev/null | grep -q '"control":true' || ((SECONDS > end)); do
+  quiver lab shot "$inst" /dev/null --settle 3 >/dev/null 2>&1
+done
+quiver lab shot "$inst" /dev/null --settle 6 >/dev/null
+quiver lab status "$inst" | sed -n 3p
+quiver lab host | head -1

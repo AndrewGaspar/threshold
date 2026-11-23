@@ -1,0 +1,239 @@
+format = 1
+surface = "threshold"
+title = "Threshold"
+help = "Control: stereoscopic 3D, DLSS Multi Frame Generation and current DLSS models."
+
+[match]
+files = ["threshold.ini"]
+
+[file.ini]
+path = "threshold.ini"
+format = "ini"
+owner = "quiver"
+reload = "poll"
+
+[[page]]
+id = "general"
+title = "General"
+options = ["game.skip_intro", "dlss.legacy_model"]
+
+[[page]]
+id = "stereo"
+title = "Stereoscopic 3D"
+options = ["stereo.mode", "stereo.output", "stereo.hyprland_tag", "stereo.separation", "stereo.convergence", "stereo.swap_eyes"]
+
+[[page.group]]
+title = "Temporal effects in 3D"
+options = ["stereo.per_eye", "stereo.dlss_per_eye"]
+
+[[page]]
+id = "fg"
+title = "Frame generation"
+options = ["fg.enabled", "fg.count", "fg.active", "fg.hudless"]
+
+[[page.group]]
+title = "Automatic multiplier and pacing"
+options = ["fg.count_min", "fg.count_max", "fg.target_hz", "fg.fps_limit", "fg.pace", "fg.camera"]
+
+[option."fg.enabled"]
+type = "bool"
+label = "DLSS Frame Generation"
+help = "DLSS-G frames between rendered ones (RTX 40+); needs the game's DLSS on, any quality. Not with HDR yet."
+default = false
+apply = "restart"
+
+[option."fg.count"]
+type = "enum"
+label = "Frame generation multiplier"
+help = "Frames shown per rendered frame. 3x-6x (Multi Frame Generation) need an RTX 50."
+values = [
+  { value = "2", label = "2x" },
+  { value = "3", label = "3x" },
+  { value = "4", label = "4x" },
+  { value = "5", label = "5x" },
+  { value = "6", label = "6x" },
+  { value = "auto", label = "Auto (to the refresh rate)" },
+]
+default = "2"
+apply = "live"
+
+[option."fg.count_min"]
+type = "enum"
+label = "Auto: lowest multiplier"
+values = [
+  { value = "2", label = "2x" },
+  { value = "3", label = "3x" },
+  { value = "4", label = "4x" },
+  { value = "5", label = "5x" },
+  { value = "6", label = "6x" },
+]
+default = "2"
+apply = "live"
+
+[option."fg.count_max"]
+type = "enum"
+label = "Auto: highest multiplier"
+values = [
+  { value = "2", label = "2x" },
+  { value = "3", label = "3x" },
+  { value = "4", label = "4x" },
+  { value = "5", label = "5x" },
+  { value = "6", label = "6x" },
+]
+default = "4"
+apply = "live"
+
+[option."fg.target_hz"]
+type = "float"
+label = "Auto: target presents per second"
+help = "What the automatic multiplier aims for; it caps the rendered rate at this divided by the multiplier."
+min = 0
+max = 500
+step = 1
+unit = "Hz"
+special = [{ value = 0, label = "Display refresh rate" }]
+default = 0
+apply = "live"
+
+[option."fg.fps_limit"]
+type = "float"
+label = "Rendered frame-rate cap"
+help = "Caps the game's own frame rate (frame generation multiplies it). Headroom keeps the game's cadence even."
+min = 0
+max = 300
+step = 1
+unit = "fps"
+special = [{ value = 0, label = "Off" }]
+default = 0
+apply = "live"
+
+[option."fg.hudless"]
+type = "bool"
+label = "Keep the HUD out of generated frames"
+help = "Gives DLSS-G the image before the HUD was drawn, so HUD elements don't smear or ghost."
+default = true
+apply = "live"
+
+[option."fg.pace"]
+type = "enum"
+label = "Present pacing"
+values = [
+  { value = "ready", label = "As soon as ready" },
+  { value = "smooth", label = "Smooth (even spacing; not yet measured)" },
+]
+default = "ready"
+apply = "live"
+
+[option."fg.camera"]
+type = "enum"
+label = "Camera data for DLSS-G"
+values = [
+  { value = "engine", label = "The game's camera" },
+  { value = "identity", label = "None (identity)", level = "debug" },
+]
+default = "engine"
+apply = "live"
+
+[option."fg.active"]
+type = "bool"
+label = "Frame generation active"
+help = "Turns generation off and on while playing, without a restart."
+default = true
+apply = "live"
+
+[option."game.skip_intro"]
+type = "bool"
+label = "Skip intro videos"
+default = true
+apply = "restart"
+
+[option."dlss.legacy_model"]
+type = "bool"
+label = "DLSS legacy (CNN) model"
+help = "On: the CNN presets (E/F); off: preset K (transformer). Quiver's DLSS model tweak overrides either, M/L included (this mod ships DLSS 310.9.16)."
+default = false
+apply = "restart"
+
+# ---------------------------------------------------------------- stereo (docs/stereo.md)
+
+[option."stereo.mode"]
+type = "enum"
+label = "3D mode"
+help = "Side-by-side renders the world twice per game update, once per eye, at about half the frame rate. Not combined with frame generation: with it enabled, 3D stays off."
+values = [
+  { value = "auto", label = "Auto: on stereo displays (HypXRland 3D mode)" },
+  { value = "off", label = "Off" },
+  { value = "sbs", label = "Side-by-side (both eyes per frame)" },
+  { value = "left", label = "Left eye only", level = "debug" },
+  { value = "right", label = "Right eye only", level = "debug" },
+]
+default = "auto"
+apply = "live"
+
+[option."stereo.output"]
+type = "enum"
+label = "Output"
+help = "How the two eyes reach the display: under HypXRland Half side-by-side (any Proton) or Full side-by-side (GE-Proton11-12-hypxr); the 3840-wide image is for a plain 3840x1080 desktop (the game's window is widened to it; use borderless or windowed, not exclusive fullscreen). None renders a normal image even with 3D mode on."
+values = [
+  { value = "auto", label = "Auto: full or half side-by-side on stereo displays, else none" },
+  { value = "hsbs", label = "Half side-by-side (HypXRland 3D mode)" },
+  { value = "sbs", label = "Full side-by-side (HypXRland 3D mode, needs GE-Proton11-12-hypxr)" },
+  { value = "full", label = "Full side-by-side (3840-wide image)" },
+  { value = "none", label = "None: normal image (no 3D)" },
+]
+default = "auto"
+apply = "restart"
+
+[option."stereo.hyprland_tag"]
+type = "bool"
+label = "Declare stereo to Hyprland"
+help = "With a side-by-side output, tag the game window stereo-sbs or stereo-hsbs over Hyprland's IPC socket so HypXRland shows each half to one eye (needs the matching window rule)."
+default = true
+level = "advanced"
+apply = "restart"
+
+[option."stereo.separation"]
+type = "float"
+label = "Eye separation"
+help = "Offset of each eye from the game camera, in millimetres (32.5 = a 65 mm interocular distance at the game's scale). Larger is deeper."
+min = 0
+max = 100
+step = 0.5
+unit = "mm"
+default = 32.5
+apply = "live"
+
+[option."stereo.convergence"]
+type = "float"
+label = "Screen distance"
+help = "Distance of the screen plane in metres: nearer things come out of the screen, farther ones sit behind it. Parallel puts distant things at the screen and everything else in front of it, HUD included."
+min = 0
+max = 50
+step = 0.5
+unit = "m"
+special = [{ value = 0, label = "Parallel" }]
+default = 4.0
+apply = "live"
+
+[option."stereo.swap_eyes"]
+type = "bool"
+label = "Swap eyes"
+help = "Cross-eyed viewing, or a display that expects the right eye on the left."
+default = false
+apply = "live"
+
+[option."stereo.per_eye"]
+type = "bool"
+label = "Separate temporal history per eye"
+help = "On: anti-aliasing, motion vectors, reflections, ray-traced denoising and volumetric light keep a history per eye. Off (for comparison only): one history for both eyes, so each eye blends in the other."
+default = true
+level = "advanced"
+apply = "live"
+
+[option."stereo.dlss_per_eye"]
+type = "bool"
+label = "Separate DLSS per eye in 3D"
+help = "On: each eye has its own DLSS history (sharp, no blending between eyes). Off: one DLSS history for both eyes."
+default = true
+level = "advanced"
+apply = "live"

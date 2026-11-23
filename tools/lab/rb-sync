@@ -1,0 +1,14 @@
+#!/usr/bin/env bash
+# tools/lab/rb-sync: push what lab runs need to rayblaster: build/mod (the mod folder; rayblaster
+# has no mingw toolchain, so we build here), tools/, re/scripts/ (analysis), and the lab fixtures
+# (locations.txt, save fixtures) for Control into its Quiver lab root.
+set -euo pipefail
+root=$(cd "$(dirname "$0")/../.." && pwd)
+host=${RB_HOST:-rayblaster}
+ssh -o BatchMode=yes "$host" "mkdir -p threshold-lab/build/mod threshold-lab/re/scripts Games/quiver-lab/fixtures/gog-2049187585"
+rsync -a --delete "$root/build/mod/" "$host:threshold-lab/build/mod/"
+rsync -a --delete "$root/tools/" "$host:threshold-lab/tools/"
+rsync -a --delete "$root/re/scripts/" "$host:threshold-lab/re/scripts/"
+fx=/home/ajg/Games/quiver-lab/fixtures/gog-2049187585
+[[ -d $fx ]] && rsync -a "$fx/" "$host:Games/quiver-lab/fixtures/gog-2049187585/"
+echo "synced to $host:threshold-lab"

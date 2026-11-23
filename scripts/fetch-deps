@@ -1,0 +1,24 @@
+#!/usr/bin/env bash
+# Fetch third-party SDKs (not vendored in git).
+set -euo pipefail
+root=$(cd "$(dirname "$0")/.." && pwd)
+mkdir -p "$root/third_party"
+cd "$root/third_party"
+# NVIDIA DLSS SDK 310.9.16: NGX headers, nvngx_dlss.dll (DLSS 4.5 presets M/L) and
+# nvngx_dlssg.dll (Frame Generation, Multi Frame Generation up to 6x).
+if [[ ! -d DLSS-310.9.16 ]]; then
+  if [[ -d $HOME/code/ac-dlss/third_party/DLSS-310.9.16 ]]; then
+    cp -r --reflink=auto "$HOME/code/ac-dlss/third_party/DLSS-310.9.16" .
+  else
+    curl -L https://github.com/NVIDIA/DLSS/archive/refs/tags/v310.9.16.tar.gz | tar xz
+  fi
+fi
+# NVAPI SDK headers (MIT) for Reflex: function IDs (nvapi_interface.h) and structs (nvapi.h).
+NVAPI_COMMIT=51e5aae4bc40c3ccd3fb7d4dfd94256e7bfc496e
+if [[ ! -d nvapi-$NVAPI_COMMIT ]]; then
+  if [[ -d $HOME/code/ac-dlss/third_party/nvapi-$NVAPI_COMMIT ]]; then
+    cp -r --reflink=auto "$HOME/code/ac-dlss/third_party/nvapi-$NVAPI_COMMIT" .
+  else
+    curl -L https://github.com/NVIDIA/nvapi/archive/$NVAPI_COMMIT.tar.gz | tar xz
+  fi
+fi

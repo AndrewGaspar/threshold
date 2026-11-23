@@ -1,0 +1,38 @@
+#!/usr/bin/env bash
+# tools/lab/continue [INSTANCE] [--watch] [launch args...]: launch Control in the lab and drive the
+# menus into the world through "Continue" (the newest save), then skip the opening cinematic(s)
+# with the nav `skip` verb (the game's own skip, docs/navigation.md) and wait until the player has
+# control (lab state in-world). --watch keeps the cinematics (waits them out instead).
+# Keys: Return (Galaxy-offline achievement box), Return (title), Escape (the DLC promo panel),
+# Return (Continue). Exits 1 if the game exits or never reaches in-world. A launch that dies
+# before the world (seen as exit code 0xD15EA5E within seconds of start, r6/r7/r15/r16/r18, more
+# often while other instances load the GPU) is retried once.
+set -euo pipefail
+inst=${1:-control}; shift || true
+skip=1
+args=()
+for a in "$@"; do
+  if [[ $a == --watch ]]; then skip=0; else args+=("$a"); fi
+done
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold}
+for attempt in 1 2; do
+  quiver lab launch "$inst" "${args[@]}" --wait frame --timeout 300 | tail -1
+  for k in Return Return Escape Return; do
+    quiver lab shot "$inst" /dev/null --settle 4 >/dev/null 2>&1 || true
+    quiver lab key "$inst" "$k" >/dev/null
+  done
+  # Still alive 15 s after Continue? Otherwise try once more.
+  if ! quiver lab wait "$inst" exited --timeout 15 >/dev/null 2>&1; then break; fi
+  if (( attempt == 1 )); then echo "the game exited right after start; relaunching once"; fi
+done
+# Hold the game's "skip skippable timelines" switch for up to 120 s; the mod lets go 4 s after
+# the last skippable cinematic ends.
+if (( skip )); then quiver lab call "$inst" skip for=120 >/dev/null || echo "skip verb failed (no nav?)"; fi
+if ! quiver lab wait "$inst" in-world --timeout $(( skip ? 180 : 400 )) >/dev/null 2>&1; then
+  if quiver lab wait "$inst" exited --timeout 1 >/dev/null 2>&1; then
+    echo "EXITED after Continue"; quiver lab status "$inst" | sed -n 3p; exit 1
+  fi
+  echo "not in-world after Continue (state: $(quiver lab status "$inst" --json | grep -o '"state": *"[a-z-]*"' | head -1))"
+  exit 1
+fi
+echo "in-world: $(quiver lab where "$inst" 2>/dev/null | head -c 300)"

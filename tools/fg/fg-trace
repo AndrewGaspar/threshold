@@ -1,0 +1,45 @@
+#!/usr/bin/env bash
+# tools/fg/fg-trace INSTANCE LABEL [dx] [period_ms] [presents] [shots]
+# Frame-pacing / interpolation measurement on a running game (in the world, frame generation as
+# configured), after Pharos's tools/fg-trace: spins the camera at a constant rate (tools/fg/spin.py
+# inside the instance: dx px of XTEST mouse-look every period_ms, default 2 px / 2 ms), arms the
+# mod's present trace (`quiver lab call INSTANCE fg trace`: per-present timestamps + image bands) once
+# the spin is steady, and analyses it with tools/fg/fg-pacing.py. Results: build-fg/fgtrace/LABEL/.
+# Run it under the GPU lock for timing numbers: quiver lab gpu -- tools/fg/fg-trace ...
+# BAND_Y / BAND_H (env) put the image band elsewhere (px; e.g. on a HUD element). Every wait has a deadline.
+set -euo pipefail
+inst=$1 label=$2 dx=${3:-2} period=${4:-2} presents=${5:-480} shots=${6:-240}
+here=$(cd "$(dirname "$0")/../.." && pwd)
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-fg}
+lab=/home/ajg/Games/quiver-lab/instances/$inst/lab/runs
+run=$(ls -1t "$lab" | head -1)
+rd=$lab/$run
+L=$rd/threshold.log
+[[ -f $L ]] || { echo "fg-trace: no threshold.log in $rd" >&2; exit 1; }
+rm -rf "$rd/fgtrace"
+before=$(quiver lab call "$inst" fg status | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["trace"]["written"])')
+start=$(wc -l < "$L")
+quiver lab exec "$inst" -- python3 -c "$(cat "$here/tools/fg/spin.py")" 14 "$dx" "$period" &
+spin=$!
+# Let the spin reach a steady rate (the game's camera smoothing) before tracing.
+quiver lab wait "$inst" frame --timeout 5 >/dev/null 2>&1 || true
+python3 -I -c 'import time; time.sleep(2.5)'
+quiver lab call "$inst" fg trace "$presents" "$shots" ${BAND_Y:+"$BAND_Y" "${BAND_H:-64}"} >/dev/null
+end=$((SECONDS + 60))
+written() {
+  local n
+  n=$(quiver lab call "$inst" fg status 2>/dev/null | python3 -I -c 'import json,sys; print(json.load(sys.stdin)["trace"]["written"])' 2>/dev/null || echo "$before")
+  [[ $n -gt $before ]]
+}
+until written || ((SECONDS >= end)); do python3 -I -c 'import time; time.sleep(0.5)'; done
+wait "$spin" || true
+written || { echo "fg-trace: no trace written (frame generation running? see $L)" >&2; exit 1; }
+out=$here/build-fg/fgtrace/$label
+rm -rf "$out"; mkdir -p "$out"
+cp "$rd"/fgtrace/* "$out/"
+tail -n +"$start" "$L" | grep -E "perf: fg" | tail -4 > "$out/perf.txt" || true
+quiver lab host > "$out/host.txt" 2>&1 || true
+echo "$run" > "$out/run.txt"
+echo "##### $label ($inst $run)"
+python3 -I "$here/tools/fg/fg-pacing.py" "$out" --json "$out/result.json" | tee "$out/report.txt"
+cat "$out/perf.txt"

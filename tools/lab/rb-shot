@@ -1,0 +1,9 @@
+#!/usr/bin/env bash
+# tools/lab/rb-shot INSTANCE LOCAL.png [shot args]: screenshot a rayblaster instance and copy it here.
+set -euo pipefail
+inst=$1; out=$2; shift 2
+remote=/tmp/threshold-shot-$$.png
+"$(dirname "$0")/rb" quiver lab shot "$inst" "$remote" "$@" >/dev/null
+scp -q "${RB_HOST:-rayblaster}:$remote" "$out"
+ssh -o BatchMode=yes "${RB_HOST:-rayblaster}" rm -f "$remote"
+echo "$out"

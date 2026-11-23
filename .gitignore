@@ -1,0 +1,17 @@
+build/
+build-*/
+compile_commands.json
+re/ghidra*/
+.claude/
+re/*.txt
+re/*.exe
+re/*.log
+*.bak
+re/bin/
+re/ghidra-logs/
+third_party/DLSS-*/
+third_party/nvapi-*/
+# Export dumps of the game's DLLs: regenerate with scripts/dump-exports (not redistributed).
+re/exports/
+__pycache__/
+*.pyc

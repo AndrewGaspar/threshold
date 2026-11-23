@@ -1,0 +1,10 @@
+#!/usr/bin/env bash
+# tools/lab/rb CMD...: run a command on rayblaster (RTX 5090, the lab host for in-game work) with
+# Quiver on PATH and an agent source. `quiver lab` has no --machine yet, so lab commands go over SSH.
+# The synced checkout is ~/threshold-lab there (tools/lab/rb-sync). Example:
+#   tools/lab/rb quiver lab status control
+#   tools/lab/rb tools/lab/continue control
+set -euo pipefail
+host=${RB_HOST:-rayblaster}
+q=$(printf '%q ' "$@")
+exec ssh -o BatchMode=yes "$host" "export PATH=\$HOME/.local/bin:\$PATH QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold} QUIVER_LAB_OWNER=${QUIVER_LAB_OWNER:-claude:threshold}; cd \$HOME/threshold-lab 2>/dev/null || true; $q"
