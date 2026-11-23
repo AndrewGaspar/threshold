@@ -489,7 +489,7 @@ Reload_t o_reload;
 std::atomic<void*> g_lc_jp{nullptr};
 std::atomic<uint64_t> g_lc_reload_tick{0}, g_lc_tail_until{0};
 std::atomic<uint64_t> g_lc_begin{0};  // when the current level change began (0: none)
-std::atomic<bool> g_load_mono{false};  // stereo.load_mono (dev): the root cause is fixed (as_once), r18
+std::atomic<bool> g_load_mono{true};  // stereo.load_mono: with as_once 5 the right eye builds new BLASes, which hung at level changes (r41/r42); mono until streaming settles (r43)
 std::atomic<uint64_t> g_n_load_mono{0}, g_n_level_changes{0};
 uintptr_t g_onIsLoading = 0;
 void __fastcall hk_useJp(void* jp, bool reload, bool debug) {
