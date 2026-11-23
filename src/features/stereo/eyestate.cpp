@@ -348,7 +348,18 @@ void hist_enter(void* r) {
     graph_flush(g_rs);
     g_rs.graph_w = rw, g_rs.graph_h = rh;
   }
-  int m = g_mask_now = g_hist_mask.load();
+  int m = g_hist_mask.load();
+  // The RT reflection filter (renderer+0x15bd0) treats its two histories as one: a non-null input
+  // history (0x912b18) means "both exist" (it then uses the output history 0x912b20 unchecked; a null
+  // one crashed, live r32), a null one makes it allocate both and free the current output history. So
+  // bit 32 only with bit 2, and when the right eye's output history is new, its input history starts
+  // over too.
+  if (!(m & 2)) m &= ~32;
+  if ((m & 32) && !g_rs.dlf[4] && g_rs.dlf[1]) {
+    g_free_tex(rt_manager(), g_rs.dlf[1]);
+    g_rs.dlf[1] = nullptr;
+  }
+  g_mask_now = m;
   uint8_t* gp = reinterpret_cast<uint8_t*>(g_rimg.at(kRvaGraphPrev));
   if (m & 1) {
     graph_cross(gp, g_rs.graph);  // debug: the left eye's latest into the right list
