@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # stereo_rb_cinematic.sh MODDIR: launch rayblaster's control-stereo with MODDIR, Continue, and let the
-# opening cinematic play untouched (no keys) through its transitions until the player has control
-# (~8 min); prints world-render counts along the way and the run's GPU-hang evidence at the end.
+# opening cinematic play untouched (no keys) through its transitions until the player has had control for ~2 min
+# (~10 min); prints world-render counts along the way and the run's GPU-hang evidence at the end.
 set -uo pipefail
 export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-stereo} QUIVER_LAB_OWNER=${QUIVER_LAB_OWNER:-claude:threshold-stereo}
 mod=$1 i=control-stereo
@@ -27,6 +27,8 @@ for n in $(seq 1 90); do
   s=$(st); echo "$(date +%T) $s"
   [ "$s" = "$last" ] && { echo "frozen"; break; }
   last=$s
-  q where $i 2>/dev/null | grep -q '"control":true' && q where $i 2>/dev/null | grep -q '"active":false' && { echo "in control"; break; }
+  # in control (a timeline can stay active with control): pass after ~2 min of control (it hung within 12 s)
+  q where $i 2>/dev/null | grep -q '"control":true' && ctl=$((${ctl:-0} + 1))
+  [ "${ctl:-0}" -ge 12 ] && { echo "in control"; break; }
 done
 ssh -o BatchMode=yes rayblaster 'L=$(ls -dt ~/Games/quiver-lab/instances/control-stereo/lab/runs/r* | head -1); echo run $L; echo signaller $(grep -c signaller $L/game.log); grep "nav: timeline\|stall: no" $L/threshold.log | tail -6; journalctl -k --since "-15min" | grep "Xid.*Control" | tail -1'
