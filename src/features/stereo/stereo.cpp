@@ -533,11 +533,13 @@ std::atomic<double> g_blas_avg{8.0};
 // level-change use-after-free (compaction frees the source BLAS). stereo.as_once = 0 runs them twice.
 // stereo.as_once is a mask: 1 = builds + compaction (above); 2 = also the dynamic-BLAS refit list
 // (+0x20, count +0x28: same pose for both eyes in one update, so the right eye's refit is redundant).
-// 4 = run only the right eye's entries the left eye's job did not run in this pair (by entry pointer):
-// an object can enter the lists between the two eyes (streaming finishes at any time), and skipping
-// its build left it unbuilt for this update.
-std::atomic<int> g_as_once{1};
-std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0}, g_n_as_new{0};
+// 4 = the right eye's job still runs the build entries the left eye's job did not run in this pair
+// (by entry pointer): objects enter the lists between the two eyes (~0.1 per pair in the world, live
+// r41), and dropping their builds left BLASes unbuilt while the TLAS used them (the in-world RT fault,
+// r20-r40). 8 = the same for compaction entries: off by default, running them hung the first teleport
+// (r41: Xid 109).
+std::atomic<int> g_as_once{5};
+std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0}, g_n_as_new{0}, g_n_as_new_built{0};
 // The job runs on a worker thread, possibly after the render thread has moved on to the right eye, so
 // the eye is the job's order within the pair (reset when the pair starts), not g_vis_phase at run time.
 std::atomic<int> g_as_pair_jobs{2};
@@ -581,10 +583,12 @@ void __fastcall hk_asJob(void** cap) {
       if (!c || !arr(o)) continue;
       for (uint32_t j = 0; j < c; j++)
         if (!std::binary_search(g_as_left[l].begin(), g_as_left[l].end(), arr(o)[j])) keep[l].push_back(arr(o)[j]);
+      bool run_new = m & (l < 2 ? 4 : 8);
       g_n_as_new += keep[l].size();
-      g_n_as_skipped += c - ((m & 4) ? keep[l].size() : 0);
+      if (l < 2) g_n_as_new_built += keep[l].size();
+      g_n_as_skipped += c - (run_new ? keep[l].size() : 0);
       sarr[l] = arr(o), scnt[l] = c, swapped[l] = true;
-      if (m & 4) {
+      if (run_new) {
         arr(o) = keep[l].data();
         cnt(o + 8) = uint32_t(keep[l].size());
       } else {
@@ -1055,7 +1059,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1063,7 +1067,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
@@ -1213,7 +1217,7 @@ void stereo_register() {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
     } else if (id == "stereo.as_once") {
-      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 1 : atoi(v.c_str());
+      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 5 : atoi(v.c_str());
     } else if (id == "stereo.video_once") {
       g_video_once = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.load_mono") {
