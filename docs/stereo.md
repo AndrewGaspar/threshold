@@ -1,6 +1,6 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r44, RT reflections):
+> **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r45, RT reflections):
 > the right eye's acceleration-structure job now runs the BLAS builds that only it has
 > (`as_once = 5`), and the frame is mono during level changes until streaming settles
 > (`load_mono = 1`, ~30-40 s after a teleport). See "Level-change hang". All
@@ -551,7 +551,7 @@ put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bi
 - Both eyes are correct afterwards, HUD in both (screenshot).
 Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
 
-**Fixed: the GPU fault in ordinary 3D play with ray tracing (rayblaster r20-r44, SDR).**
+**Fixed: the GPU fault in ordinary 3D play with ray tracing (rayblaster r20-r45, SDR).**
 Continue from the game-start fixture, let the opening cinematic play untouched
 (`re/scripts/stereo_rb_cinematic.sh MODDIR`): the player gets control at ~431 s, and in sbs the GPU
 faults some seconds to minutes later. Every fault is the same (`Xid 13`, "SM Warp Exception: MMU
@@ -597,7 +597,7 @@ the world), so the frame stays mono while the engine changes level and until BLA
 | r41 | `as_once = 5`, new compactions run too (then bit 4 covered all lists) | **14 min in the world, no fault**; first teleport: `Xid 109` |
 | r42 | `as_once = 5` (builds only) | **10 min in the world, no fault** (5480 new builds run); first teleport: `Xid 109` |
 | r43 | `as_once = 5`, `load_mono = 1` | **22 teleports in 610 s, no Xid, no `signaller_worker` timeout** |
-| r44 | the shipped defaults on main + this branch | see below |
+| r45 | the shipped defaults (main 0a5eb41 merged in, `as_once = 5`, `load_mono = 1`) | **10 min in the world, then 9 teleports in 256 s: no Xid, no `signaller_worker` timeout** (7 level changes settled back to 3D) |
 
 Leads checked and ruled out: the eye's `m::View` copy is not kept past `renderWorld` (static:
 renderer+0x11daf0 copies it into the renderer's own `rend::View` at +0x678 and clears its only
