@@ -1,8 +1,9 @@
 # DLSS Frame Generation / Multi Frame Generation
 
 > **Branches:** on `main`, `[fg] pace` defaults to `ready` (the measured v1 behaviour). `smooth` is
-> built but not yet A/B-measured; branch `wip/fg-pacing` makes it the default. `count = auto` is opt-in
-> and has not been run live yet (resume notes at the end).
+> built but not yet A/B-measured; branch `wip/fg-pacing` makes it the default. `count = auto` (opt-in)
+> and HDR frame generation are verified live on rayblaster (behaviour and HDR captures, not timing;
+> see below). Resume notes at the end.
 
 Control has no frame generation. Threshold adds it through NGX directly (no Streamline), on the
 game's own D3D12 device, queue and NGX instance. Code: `src/features/fg/`: `fg.cpp` (inputs,
