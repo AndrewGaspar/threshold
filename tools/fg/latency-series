@@ -1,0 +1,23 @@
+#!/usr/bin/env bash
+# tools/fg/latency-series INSTANCE PREFIX "label|key=value ..." ...
+# Live latency A/B in one session: sets [fg] keys (quiver lab set --wait), lets it settle (SETTLE s,
+# default 20: the automatic cap converges at a few % per second), then runs tools/fg/latency under
+# the GPU lock (COUNT injections, default 40). Results: build-fg/latency/PREFIX-LABEL/.
+set -uo pipefail
+inst=$1 prefix=$2; shift 2
+here=$(cd "$(dirname "$0")/../.." && pwd)
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-fg}
+for spec in "$@"; do
+  label=${spec%%|*}; kvs=${spec#*|}
+  [[ $kvs == "$spec" ]] && kvs=""
+  for kv in $kvs; do
+    quiver lab set "$inst" "install:threshold.ini:[fg]${kv}" --wait >/dev/null 2>&1 || true
+  done
+  python3 -I -c "import time; time.sleep(${SETTLE:-20})"
+  timeout 300 quiver lab gpu --for "$inst" -- "$here/tools/fg/latency" "$inst" "$prefix-$label" "${COUNT:-40}" 150 \
+    >/dev/null 2>&1 || echo "$label: latency run failed"
+  d=$here/build-fg/latency/$prefix-$label
+  echo "##### $label ($kvs)"
+  grep -E "frames:|reactions|eval recorded|frame done|first present|real present" "$d/report.txt" 2>/dev/null
+  tail -n 1 "$d/perf.txt" 2>/dev/null | cut -c14-230 | sed 's/^/    /'
+done

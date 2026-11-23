@@ -2,7 +2,9 @@
 
 > **Defaults:** `[fg] pace = smooth` (measured better than `ready` in every valid pair, section 4).
 > `count = auto` (opt-in) and HDR frame generation are verified live on rayblaster (behaviour and HDR
-> captures). Still open: Pharos's headroom cap for uncapped high multipliers; latency. Resume notes at the end.
+> captures). Latency measured (section 8): FG adds ~3 ms (2x) / ~4 ms (4x) to the first present at
+> ~200 rendered fps. The headroom cap (`auto_cap`, 7) and injected Reflex (`reflex`, 9) work but cost
+> or gain nothing measurable here, so both default off. Resume notes at the end.
 
 Control has no frame generation. Threshold adds it through NGX directly (no Streamline), on the
 game's own D3D12 device, queue and NGX instance. Code: `src/features/fg/`: `fg.cpp` (inputs,
@@ -269,6 +271,104 @@ Frame stats: max 249–266 nits, average 12, p99 142–144 for all four; no NaN 
 PQ round trip is right (generated ≈ real to within capture noise), and the HUD survives in generated
 frames. The present trace's bands assume 4-byte pixels: in HDR they are not decodable yet.
 
+### 7. Headroom cap (`[fg] auto_cap`, rayblaster r7, default **off**)
+
+Pharos's `auto_cap`, folded into the once-a-second controller (`auto_step` in `fg.cpp`): if DLSS-G
+finished later than `auto_cap_lag` (0.7) of a frame interval after the game's Present, or the game
+waited for the present thread on more than 2 % of its frames, the cap drops to 96 % of the rate
+reached; within `auto_cap_lag − 0.15` and no waits it rises 1 % (4 % below `− 0.35`), only while it
+binds. The limiter applies min(headroom cap, `target_hz` / multiplier). `count = auto` steps up when
+the headroom cap can't hold the target.
+
+A/B live (`fg-series`, `target_hz = 1000` so only the headroom cap binds, `SETTLE=15`, each trace
+under `quiver lab gpu`; host: `control-stereo` and `awr-bridge` (Torchbearer) on the GPU, 79–98 %
+busy):
+
+| pair | cap | real fps | game waited /2 s | DLSS-G done ms | interval sd ms | residual px |
+|---|---|---|---|---|---|---|
+| h2-m2 / c2 | off / on | 103.9 / 98.5 | 61 / 0 | 13.0 / 4.2 | 0.61 / 1.03 | 7.10 / 3.69 |
+| h2-m2b / c2b | off / on | 150.2 / 112.7 | 0 / 0 | 6.1 / 4.8 | 0.64 / 0.86 | 3.33 / 6.74 |
+| h2-m4 / c4 | off / on | 135.0 / 91.0 | 159 / 0 | 8.1 / 5.6 | 0.59 / 0.52 | 2.92 / 3.28 |
+| h2-m4b / c4b | off / on | 127.4 / 95.1 | 159 / 1 | 8.9 / 5.6 | 0.64 / 0.70 | 3.56 / 2.37 |
+
+It does what it is for (the waits go to 0, DLSS-G finishes in 0.5–0.7 frames) but costs 5–33 % of
+the frame rate, and pacing and residual don't improve consistently. The latency (8) decides it:
+
+### 8. Latency (rayblaster r7–r8, `tools/fg/latency`)
+
+The mod logs per rendered frame the camera basis and CPU time at the game's DLSS evaluation, GPU
+timestamps right after it, when the queue reached our Present-time work (the frame's own GPU work
+done) and after DLSS-G, and our Present calls for that frame (`fg latency start|stop` → `latency.csv`,
+`latency.cpp`). `tools/fg/latency` injects 40 mouse-look motions (`quiver lab mouse --repeat 40 --gap
+0.4-0.7 --log`, CLOCK_MONOTONIC_RAW) and `latency.py` takes the first frame whose camera turned (by
+> 0.05°) after each one. Stages are ms after the input (median, p10–p90); "first present" is our
+first Present call carrying the frame (a generated frame interpolated towards it, with FG), "real
+present" the real frame's. Scan-out and compositor are not included (headless). FG off = `active =
+0` (the same proxy path, without generation). 40 of 40 reactions found in every run. Each run under
+`quiver lab gpu`; DLSS Quality 1280x720 → 1920x1080, RT off.
+
+| run | fps | eval recorded | frame done (GPU) | first present | real present | waits /2 s | host GPU |
+|---|---|---|---|---|---|---|---|
+| FG off (l1-offb) | 219.8 | 11.4 (9.2–16.6) | 12.5 (10.3–17.7) | **11.9** (9.6–17.1) | 11.9 | 0 | 41 %, control-stereo |
+| 2x (l1-m2b) | 200.4 | 12.0 (10.0–15.0) | 13.2 (11.3–16.5) | **15.0** (12.7–17.8) | 17.8 (15.3–20.2) | 0 | 53 % |
+| 2x + cap (l1-c2b) | 201.0 | 12.9 (10.0–16.8) | 14.1 (11.3–18.0) | 15.6 (12.8–19.4) | 18.1 (15.2–22.1) | 0 | 59 % |
+| 4x (l1-m4b) | 197.4 | 12.9 (9.9–16.4) | 14.2 (11.5–17.5) | **16.2** (13.4–19.4) | 20.2 (17.2–23.3) | 13 | 63 % |
+| 4x + cap (l1-c4b) | 170.5 | 14.8 (11.6–17.7) | 16.0 (12.9–18.9) | 17.9 (15.7–21.4) | 22.4 (20.0–25.8) | 0 | 61 % |
+| 2x, contended (l1-m2) | 173.7 | 14.2 | 18.1 | 20.2 (17.1–23.3) | 23.5 | 9 | 93 %, + awr-bridge |
+| 2x + cap, contended (l1-c2) | 152.9 | 16.3 | 18.8 | 22.1 (16.9–24.4) | 25.5 | 0 | 65 % |
+| 4x, contended (l1-m4) | 160.1 | 16.1 | 20.0 | 22.9 (17.9–28.4) | 27.5 | 157 | 87 % |
+| 4x + cap, contended (l1-c4) | 108.2 | 21.7 | 24.3 | 28.1 (24.4–32.2) | 35.0 (31.6–39.3) | 0 | 90 % |
+
+- **Frame generation costs** about +3 ms (2x) and +4 ms (4x) to the first present at ~200 rendered
+  fps, and +6 / +8 ms to the real frame (it is held (m−1)/m of an interval behind the generated ones).
+- **The headroom cap costs latency here** in every pair (+0.3 to +5 ms to the first present): the
+  waits it removes are short (1–1.6 ms) on a GPU with DLSS-G at 2–7 ms, while the lower frame rate
+  lengthens the whole pipeline. Pharos's D3D11 game, with DLSS-G on a second device the game's
+  queue knew nothing about, had longer queues to drain. So `auto_cap` stays available, **off by
+  default**; `count = auto` still caps at the refresh target.
+
+### 9. Reflex (`[fg] reflex`, rayblaster r8)
+
+Control has no Reflex. `reflex.cpp` (after Pharos's `src/reflex/`) loads `nvapi64.dll` (dxvk-nvapi
+v0.9.3 in Proton with `PROTON_ENABLE_NVAPI=1`) and calls `NvAPI_D3D_SetSleepMode` /
+`NvAPI_D3D_Sleep` / `NvAPI_D3D_SetLatencyMarker` with the game's **ID3D12Device**: dxvk-nvapi maps
+D3D12 to vkd3d-proton's `ID3DLowLatencyDevice`, which drives `VK_NV_low_latency2` (the device has it:
+`low_latency2 true` in the Sight layer's line). Live: `SetSleepMode(low_latency=1) -> 0`,
+`GetSleepStatus -> 0 (low_latency=1)`; the sleep runs once per rendered frame at the end of the game's
+Present, after our cap (`perf: reflex sleep avg ...`), on a sleeper thread with a 500 ms watchdog (0
+overruns). Markers: SIMULATION_START after the sleep, PRESENT_START / PRESENT_END around the game's
+Present (one app frame per rendered frame; the generated presents come from our thread). No driver
+minimum interval: Pharos found DXVK's tracker drops it with several presents per frame.
+
+Same build and settings as 8, A/B live (`latency-series r1`, each under `quiver lab gpu`; host:
+`control-stereo` only, 40–70 % busy except x2r0):
+
+| run | Reflex | fps | first present | real present | eval recorded |
+|---|---|---|---|---|---|
+| r1-off0 / off1 | off / on | 211.5 / 204.2 | 12.6 / 12.3 | – | 12.1 / 11.5 |
+| r1-off0b / off1b | off / on | 211.5 / 213.1 | 12.5 / 11.1 | – | 11.8 / 10.4 |
+| r1-x2r0b / x2r1b | off / on | 207.4 / 199.7 | 14.4 / 15.0 | 16.9 / 17.6 | 11.5 / 12.1 |
+| r1-x4r0 / x4r1 | off / on | 203.3 / 191.6 | 15.9 / 16.9 | 19.8 / 20.8 | 12.7 / 13.4 |
+| r1-x4r0b / x4r1b | off / on | 193.8 / 192.3 | 16.3 / 15.8 | 20.3 / 19.8 | 12.9 / 12.4 |
+| (r1-x2r0 / x2r1: the stereo instance at 97 % during x2r0, not comparable) | | 164.6 / 202.0 | 22.1 / 14.3 | 25.2 / 16.9 | |
+
+The Reflex sleep averaged 0.1 ms per frame: at ~200 fps on the RTX 5090 the game is not GPU-queue
+bound (the renderer thread is what limits it), so there is nothing for Reflex to drain, and the
+differences (−1.4 to +1.0 ms) are within run-to-run noise. Heavier (r9: render 2880x1620 supersampled DLAA, RT
+on; ~145–155 fps, GPU 83–97 % busy with `control-stereo`; reaction threshold raised to 0.21° by
+`latency.py` because this camera swayed 0.07° per frame):
+
+| run | Reflex | fps | first present | real present |
+|---|---|---|---|---|
+| r2-off0 / off1 | off / on | 155.1 / 150.4 | 16.7 (14.6–19.7) / 17.4 (14.2–23.5) | – |
+| r2-x2r0 / x2r1 | off / on | 144.0 / 142.6 | 23.5 / 24.7 | 27.2 / 28.4 |
+| r2-x2r0b / x2r1b | off / on | 144.1 / 139.8 | 25.2 / 24.2 | 28.6 / 27.8 |
+
+Still no effect (sleep 0.3 ms per frame). The likely reason, besides the fast GPU: Control's own
+`d3d::DeviceUtil::present` already spins until the GPU is at most one frame behind ("DX12:Wait for
+present", default on; static, re/dlss.md 2.3), so there is no render queue for Reflex to drain. Reflex
+therefore stays **off by default**; it is there for slower GPUs, where it is still to be measured.
+
 ## Options (`[fg]`)
 
 | key | default | |
@@ -278,6 +378,8 @@ frames. The present trace's bands assume 4-byte pixels: in HDR they are not deco
 | `count_min`, `count_max` | 2, 4 | `auto`'s range; live |
 | `target_hz` | 0 | presents/s `auto` aims for; 0 = the display refresh (detected: `fg: display refresh`); live |
 | `fps_limit` | 0 | rendered frames/s cap (0 = none; `auto` caps at `target_hz / multiplier` itself); live |
+| `auto_cap`, `auto_cap_lag` | 0, 0.7 | headroom cap (7), with the refresh cap; live |
+| `reflex`, `reflex_markers` | off, 1 | injected Reflex: `off` / `on` / `boost` (9); live |
 | `active` | 1 | live on/off (off: rendered frames only, through the same path) |
 | `camera` | engine | `engine` / `identity`; live |
 | `hudless` | 1 | pass the HUD-less copy as `DLSSG.HUDLess`; live |
@@ -298,51 +400,26 @@ installed with `enabled = 1`.
 
 ## Open
 
-- **Pacing A/B (`smooth` vs `ready`) and `count = auto` need a run on an idle GPU** (commands in 4
-  and 5). Every measurement here shared the GPU with other lab instances; absolute fps should be
-  retaken too.
-- A headroom cap like Pharos's `auto_cap` (cap from how late DLSS-G finishes): uncapped, DLSS-G
-  finishes 1.2–1.5 real intervals after the game's Present at 4x and the game waits for the present
-  thread; `fps_limit` (or `count = auto`'s refresh cap) is the manual answer for now.
+- Every measurement shared rayblaster's GPU with other lab instances (noted per row); absolute fps
+  move with their load.
+- Latency on a slower GPU (where the game is GPU-bound and Reflex / the headroom cap could matter);
+  the laptop's RTX 5070 is the obvious place once the lab can run one instance there again.
+- Scan-out: the latency stops at our Present call; Quiver's Sight layer (`VK_NV_low_latency2` / present
+  timing) could extend it to the display.
 - Moving HUD elements (reticle, damage numbers) under HUD-less: not measured.
 - HUD-less assumes the default in-game brightness (`copyWithGamma` identity); check another
   brightness, or take the HUD-less image after `end`'s blit.
-- Reflex: the game has none; latency markers/sleep would have to be injected (Pharos did, through
-  dxvk-nvapi). The limiter is a plain CPU sleep on the renderer thread.
+- Reflex markers: one app frame per rendered frame while our thread makes 2–6 presents; whether
+  vkd3d-proton's tracker copes as DXVK's didn't (Pharos) is not checked (latency unchanged either
+  way).
 - HDR: the trace can't decode FP16 bands; HUD-less in HDR assumes `copyWithGamma` is the identity for
   scRGB as well (measured equal outside the HUD, 6).
 - Stereo + FG: not combined (stereo stays off with `[fg] enabled`). The HUD-less vtable patch chains
   into stereo's detour if both ever run.
 
-## Resume notes (2026-11-23, branch `wip/fg-pacing`)
+## Resume notes (2026-11-23, branch `wip/fg-latency-reflex`)
 
-**State.** All measured: 1–3 on the laptop; 4 (pacing A/B: `smooth` better in every valid pair), 5
-(`count = auto` behaviour) and 6 (HDR) on rayblaster. Next: Pharos's headroom cap for uncapped
-play (4: the game waits for the present thread at 4x uncapped), and latency (`smooth` vs `ready`).
-The commands below retake 4.
-
-Instance `control-fg` on rayblaster: 1920x1080@165, currently **HDR** (`display.hdr=on`,
-renderer.ini `m_eAllowHDR 1`; otherwise DLSS Quality 1280x720, RT off, motion blur / film grain off,
-intro skip). The trace bands need SDR: switch back first.
-
-```sh
-cd ~/code/threshold-wt/fg && scripts/build
-export QUIVER_SOURCE=agent:threshold-fg QUIVER_LAB_OWNER=claude:threshold-fg Q="quiver --machine rayblaster"
-$Q lab edit control-fg display.hdr=off && $Q lab down control-fg && $Q lab up control-fg
-ssh rayblaster "python3 -c \"import json;p='/home/ajg/Games/quiver-lab/instances/control-fg/install/renderer.ini';d=json.load(open(p));d['m_eAllowHDR']=0;json.dump(d,open(p,'w'),indent=1)\""
-$Q lab status control-fg | grep -i throttl          # must print nothing
-tools/fg/moddir /tmp/mod-fg fg.enabled=1
-tools/fg/launch control-fg /tmp/mod-fg              # Q set: drives rayblaster, uploads the mod
-rsync -a tools/fg/ rayblaster:threshold-lab/tools/fg/
-# fg-trace/fg-series run where the instance is (they read its run folder and spin via `quiver lab exec`):
-tools/lab/rb tools/fg/fg-series control-fg p2 "r2|pace=ready count=2 fps_limit=0" "s2|pace=smooth" \
-  "r4|pace=ready count=4" "s4|pace=smooth" "r4b|pace=ready" "s4b|pace=smooth" \
-  "r4c|pace=ready fps_limit=40" "s4c|pace=smooth" "r2c|pace=ready count=2 fps_limit=80" "s2c|pace=smooth"
-rsync -a rayblaster:threshold-lab/build-fg/fgtrace/ build-fg/fgtrace/
-python3 -I tools/fg/fg-table.py build-fg/fgtrace/p2-*
-$Q lab down control-fg
-```
-
-Then fill section 4. If uncapped `smooth` still shows "game waited" in the perf lines with DLSS-G done
-> 0.7 of the interval, add Pharos's headroom cap (`auto_cap`) in `limit()` / `auto_step()` in
-`fg.cpp`.
+Done: 7 (headroom cap, default off), 8 (latency), 9 (Reflex injection, default off; works, no
+measured effect at these frame rates). Instance `control-fg` on rayblaster is down, back on the
+standard scene settings (SDR 1920x1080@165, render 1280x720, RT off). Commands as before (`tools/fg/launch`, `tools/lab/rb
+tools/fg/fg-series`, `tools/lab/rb tools/fg/latency-series`, `tools/fg/latency-table.py`).

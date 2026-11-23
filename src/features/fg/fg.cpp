@@ -29,6 +29,8 @@
 #include "features/fg/common.h"
 #include "features/fg/engine.h"
 #include "features/fg/hdr.h"
+#include "features/fg/latency.h"
+#include "features/fg/reflex.h"
 #include "features/fg/trace.h"
 
 namespace th::fg {
@@ -180,6 +182,7 @@ struct Job {
   int pace = 1;         // 0 ready, 1 smooth (default: better in every A/B pair, docs/fg.md 4)
   double relax = 0.5;
   uint64_t id = 0;
+  uint64_t frame = 0;  // S.frame of this job (latency rows)
 };
 
 struct State {
@@ -189,6 +192,11 @@ struct State {
   std::atomic<unsigned> count_min{2}, count_max{4};
   std::atomic<double> target_hz{0};       // [fg] target_hz: presents/s to aim for (0 = the display refresh)
   std::atomic<double> fps_limit{0};       // [fg] fps_limit: rendered frames/s cap (0 = none; auto sets its own)
+  std::atomic<bool> auto_cap{false};      // [fg] auto_cap: headroom cap (Pharos), with the refresh cap
+  std::atomic<double> auto_cap_lag{0.7};  // [fg] auto_cap_lag: DLSS-G done after the game's Present, in frames
+  double head = 0;                        // the headroom cap (fps; 0 = not yet set)
+  int64_t fg_since = 0;                   // first frame of the current run of generated frames
+  unsigned aw_joins = 0;                  // renderer-thread waits for the present thread in this window
   double refresh_hz = 0;                  // detected display refresh
   unsigned auto_count = 2;                // count = auto: the current multiplier
   // limiter (renderer thread, end of takeover) and the frame's own work time
@@ -306,6 +314,7 @@ uint32_t __cdecl hk_Eval(ID3D12GraphicsCommandList* cl, const void* handle, cons
   barrier(cl, mv, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrv);
   in.ok = true;
   if (!camera_read(in.cam)) in.cam.ok = false;
+  lat_eval(cl, in.cam, S.frame);
   hudless_arm(S.engine_ok && S.hudless.load());  // this frame has DLSS inputs: copy its HUD-less colour
   static int logged = 0;
   if (logged++ < 2)
@@ -410,6 +419,7 @@ bool ensure_outputs(Set& st, unsigned n) {
 // Records copy-aside + DLSS-G evaluation for this frame; returns the number of generated frames.
 unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* hud) {
   ID3D12GraphicsCommandList* cl = S.rring.begin();
+  lat_begin(cl, S.frame);
   // The real frame, set aside (the engine renders into this proxy again two frames later).
   barrier(cl, proxy, D3D12_RESOURCE_STATE_PRESENT, D3D12_RESOURCE_STATE_COPY_SOURCE);
   to(cl, st.real, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -585,6 +595,7 @@ void present_tex(ID3D12Resource* src, const Job& j, char kind, int gi, int gn, i
   int ti = trace_copy(S.dev, cl, src, S.fmt, kind, j.id, j.arrive_us, step, S.interval_us, gi, gn);
   uint64_t v = S.pring.submit(S.q);
   trace_call(ti);
+  lat_present(j.frame, kind);
   S.last_call_us = now_us();
   present_real(S.sc, j.sync, j.flags);
   S.last_present_us = now_us();
@@ -745,9 +756,12 @@ void detect_refresh() {
 // count = auto the target / multiplier (presents stay at or below the target).
 void limit(bool fg_frame) {
   double cap = S.fps_limit.load();
-  if (S.count_auto && fg_frame) {
-    double a = target_now() / std::max(1u, S.auto_count);
-    cap = cap > 0 ? std::min(cap, a) : a;
+  if (fg_frame && cap <= 0) {
+    // An explicit fps_limit overrides; else auto_cap's headroom cap and the refresh cap, or count =
+    // auto's refresh cap alone.
+    const double r = target_now() / std::max(1u, count_now());
+    if (S.auto_cap) cap = S.head > 0 ? std::min(S.head, r) : 0;
+    else if (S.count_auto) cap = r;
   }
   S.cap_now = cap;
   S.lim_sleep_us = 0;
@@ -764,25 +778,67 @@ void limit(bool fg_frame) {
   S.lim_next += period;
 }
 
-// count = auto (Pharos's controller, without Reflex): once a second, from the rendered frames' own work
-// time (arrival interval minus the limiter's sleep and waits for the present thread), in
-// [count_min, count_max]: one step up when the game can't hold target / multiplier (10 % short, 2 s);
-// one step down when it could hold target / (multiplier - 1) with 15 % to spare (3 s). A step down
-// undone within 30 s blocks further steps down for 10 s, doubling up to 60 s (Pharos: 6 s; the
-// renderer-side work time overestimates a capped game, see docs/fg.md). Windows with a hitch
-// (below 60 % of the cap) change nothing.
+// Once a second (renderer thread), from this window's frames:
+//
+// auto_cap (Pharos's headroom cap, [fg] auto_cap = 1): without headroom the GPU queue fills, DLSS-G
+// finishes more than a frame after the game's Present, the present thread falls behind and the game
+// blocks on it at irregular times (uneven game frame times, more latency; docs/fg.md 4). If DLSS-G
+// finished later than auto_cap_lag (0.7) of a frame interval after the game's Present on average, or
+// the game waited for the present thread on more than 2 % of its frames, the headroom cap drops to
+// 96 % of the rate reached; if it finished within auto_cap_lag - 0.15 and the game never waited, it
+// rises 1 % (4 % below auto_cap_lag - 0.35), only while it is the binding cap. It starts 2 s into a
+// run of generated frames at 90 % of the rate then. The limiter applies min(headroom cap, target /
+// multiplier): presents stay at or below the refresh target.
+//
+// count = auto: in [count_min, count_max]: one step up when the game can't hold target / multiplier
+// (its own work rate, a manual fps_limit or the headroom cap 10 % short, 2 s); one step down when its
+// work rate could hold target / (multiplier - 1) with 15 % to spare and DLSS-G finished within 0.55 of
+// that shorter interval (3 s). A step down undone within 30 s blocks further steps down for 10 s,
+// doubling up to 60 s (Pharos: 6 s; the renderer-side work time overestimates a capped game). Windows
+// with a hitch (below 60 % of the cap) change nothing.
 void auto_step(int64_t now) {
   if (!S.aw_start) S.aw_start = now;
   if (now - S.aw_start < 1000000) return;
   const double secs = (now - S.aw_start) / 1e6;
-  const unsigned frames = S.aw_frames;
+  const unsigned frames = S.aw_frames, joins = S.aw_joins;
   const double work_fps = S.aw_work > 0 ? frames * 1e6 / double(S.aw_work) : 0;
   const double real_fps = frames / secs;
   S.aw_start = now;
   S.aw_work = 0;
+  S.aw_frames = 0;
+  S.aw_joins = 0;
   const int64_t lag_n = S.aw_lag_n.exchange(0), lag_sum = S.aw_lag_sum.exchange(0);
   const double lag_us = lag_n ? double(lag_sum) / lag_n : 0;
-  S.aw_frames = 0;
+  const double target = target_now();
+  const double lim = S.fps_limit.load();
+  const bool generating = S.chain && frames >= 5;
+  if (!generating) S.fg_since = 0;
+  else if (!S.fg_since) S.fg_since = now;
+  const bool hitch = S.cap_now > 0 && real_fps < 0.6 * S.cap_now;
+
+  // ---- headroom cap
+  const double ratio = real_fps > 1 && lag_n ? lag_us * real_fps / 1e6 : 0;  // DLSS-G lag in frames
+  const double thr = S.auto_cap_lag.load();
+  const bool overloaded = ratio > thr || joins > real_fps * secs * 0.02;
+  if (!S.auto_cap || lim > 0 || !generating || now - S.fg_since < 2000000) {
+    if (!generating) S.head = 0;
+  } else if (!hitch) {
+    const double r = target / std::max(1u, count_now());
+    const double was = S.head;
+    if (S.head <= 0) S.head = (S.cap_now > 0 ? std::min(S.cap_now, real_fps) : real_fps) * 0.9;
+    else if (overloaded) S.head = std::min(S.cap_now > 0 ? S.cap_now : S.head, real_fps) * 0.96;
+    else if (S.head <= r * 1.001 && joins == 0) {
+      if (ratio < thr - 0.35) S.head *= 1.04;
+      else if (ratio < thr - 0.15) S.head *= 1.01;
+    }
+    S.head = std::max(20.0, std::min(500.0, S.head));
+    if (std::fabs(S.head - was) > 3.0 || was <= 0)
+      TH_LOG("fg: auto cap %.1f fps (headroom %.1f, refresh %.1f; real %.1f fps, DLSS-G done %.1f ms = %.2f frames after "
+             "the game's Present, game waited %u times)", std::min(S.head, r), S.head, r, real_fps, lag_us / 1000.0,
+             ratio, joins);
+  }
+
+  // ---- count = auto
   if (!S.count_auto) {
     S.auto_count = std::max(2u, std::min(S.count.load(), S.caps_max_gen + 1));
     S.up_streak = S.down_streak = 0;
@@ -790,20 +846,19 @@ void auto_step(int64_t now) {
   }
   const unsigned lo = std::max(2u, S.count_min.load()), hi = std::min(std::max(lo, S.count_max.load()), S.caps_max_gen + 1);
   unsigned m = std::max(lo, std::min(hi, S.auto_count));
-  if (frames < 5 || (S.cap_now > 0 && real_fps < 0.6 * S.cap_now)) {  // hitch, menus, loading
+  if (frames < 5 || hitch) {  // hitch, menus, loading
     S.up_streak = S.down_streak = 0;
     S.auto_count = m;
     return;
   }
-  const double target = target_now();
   // What the game can deliver: its own work rate, no more than a manual cap ([fg] fps_limit 40 with a
-  // 165 Hz target means 4x).
-  const double lim = S.fps_limit.load();
-  const double can = lim > 0 ? std::min(work_fps, lim) : work_fps;
+  // 165 Hz target means 4x) or the headroom cap.
+  double can = lim > 0 ? std::min(work_fps, lim) : work_fps;
+  const double can_up = S.auto_cap && lim <= 0 && S.head > 0 ? std::min(can, S.head) : can;
   // The renderer thread's work time misses the GPU once frames are capped with headroom, so a step down
   // also needs DLSS-G to finish early enough for the shorter interval (Pharos: lag below 0.55 of it).
-  const double lag_ok = lag_us < 0.55 * 1e6 * (m - 1) / target;
-  S.up_streak = m < hi && can < 0.9 * target / m ? S.up_streak + 1 : 0;
+  const bool lag_ok = lag_us < 0.55 * 1e6 * (m - 1) / target && !overloaded;
+  S.up_streak = m < hi && can_up < 0.9 * target / m ? S.up_streak + 1 : 0;
   S.down_streak = m > lo && can > 1.15 * target / (m - 1) && lag_ok ? S.down_streak + 1 : 0;
   unsigned was = m;
   if (S.up_streak >= 2) {
@@ -816,11 +871,12 @@ void auto_step(int64_t now) {
   } else if (S.down_streak >= 3 && now >= S.down_block_until) {
     m--;
     S.last_down_us = now;
+    S.head = std::max(S.head, target / m);  // the headroom cap may rise to the new refresh cap
   }
   if (m != was) {
     S.up_streak = S.down_streak = 0;
-    TH_LOG("fg: count auto %ux -> %ux (work %.1f fps, real %.1f fps, DLSS-G done %.1f ms after Present, target %.0f "
-           "presents/s, cap %.1f)", was, m, work_fps, real_fps, lag_us / 1000.0, target, lim > 0 ? std::min(lim, target / m) : target / m);
+    TH_LOG("fg: count auto %ux -> %ux (work %.1f fps, real %.1f fps, DLSS-G done %.1f ms after Present, headroom %.1f, "
+           "target %.0f presents/s)", was, m, work_fps, real_fps, lag_us / 1000.0, S.head, target);
   }
   S.auto_count = m;
 }
@@ -830,6 +886,7 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   if (!S.enabled || !S.sc || sc != (IDXGISwapChain*)S.sc || !S.proxy[0].r) return false;
   if (!real_buffers()) return false;
   detect_refresh();
+  reflex_present_begin(S.dev);
   // Which proxy did the engine just render? Its own index flips after Present (re/dlss.md 2.2).
   void* nt = g_auto_bb();
   ID3D12Resource* proxy = nt ? *reinterpret_cast<ID3D12Resource**>(static_cast<char*>(nt) + 0x88) : nullptr;
@@ -870,6 +927,7 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
     S.join_us = now_us() - j0;
     if (S.join_us > 500) {
       S.p_join++;
+      S.aw_joins++;
       S.join_sum += S.join_us;
     }
   }
@@ -904,6 +962,8 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   j.step_us = std::min<int64_t>(S.interval_us, 50000) / (n_gen + 1);
   j.pace = S.pace.load();
   j.relax = S.relax.load();
+  lat_end(S.rring.list[S.rring.cur], S.frame, n_gen, t);
+  j.frame = S.frame;
   j.eval_v = S.rring.submit(S.q);
   j.sync = sync;
   j.flags = flags;
@@ -918,6 +978,11 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   perf();
   auto_step(t);
   limit(n_gen > 0);
+  // Reflex (reflex.cpp): the driver's sleep before the next frame starts, after our cap. Counted with
+  // the limiter's sleep as time the frame didn't work.
+  const int64_t r0 = now_us();
+  reflex_present_end(S.dev);
+  S.lim_sleep_us += now_us() - r0;
   return true;
 }
 
@@ -1045,6 +1110,10 @@ void fg_register() {
     else if (id == "fg.count_max") S.count_max = std::max(2, std::min(6, atoi(v.c_str())));
     else if (id == "fg.target_hz") S.target_hz = std::max(0.0, atof(v.c_str()));
     else if (id == "fg.fps_limit") S.fps_limit = std::max(0.0, atof(v.c_str()));
+    else if (id == "fg.auto_cap") S.auto_cap = v != "0" && v != "false" && v != "off";
+    else if (id == "fg.reflex") reflex_config(v == "boost" ? 2 : v == "on" || v == "1" ? 1 : 0, cfg_bool("fg.reflex_markers", true));
+    else if (id == "fg.reflex_markers") reflex_config(cfg_str("fg.reflex") == "boost" ? 2 : cfg_str("fg.reflex") == "on" ? 1 : 0, v != "0" && v != "false" && v != "off");
+    else if (id == "fg.auto_cap_lag") S.auto_cap_lag = std::max(0.2, std::min(2.0, atof(v.c_str())));
     else if (id == "fg.active") S.on = v != "0" && v != "false" && v != "off";
     else if (id == "fg.show")
       S.show = v == "generated" ? State::kGenerated : v == "real" ? State::kReal : v == "hudless" ? State::kHudless : State::kAll;
@@ -1063,7 +1132,14 @@ void fg_register() {
       }
       return "{\"enabled\":" + std::string(S.enabled ? "true" : "false") + ",\"feature\":" +
              std::string(S.feature ? "true" : "false") + ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
-             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + "}";
+             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() + "}";
+    }
+    if (sub == "latency") {
+      std::string what = a.size() > 1 ? a[1] : "";
+      if (what == "start") return json_str(lat_start(S.dev, S.q));
+      if (what == "stop") return json_str(lat_stop());
+      ok = false;
+      return json_str("usage: fg latency start|stop");
     }
     if (sub == "trace") {
       unsigned n = a.size() > 1 ? unsigned(atoi(a[1].c_str())) : 480;

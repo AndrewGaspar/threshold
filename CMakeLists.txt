@@ -36,6 +36,8 @@ add_library(threshold SHARED
   src/features/fg/trace.cpp
   src/features/fg/engine.cpp
   src/features/fg/hdr.cpp
+  src/features/fg/latency.cpp
+  src/features/fg/reflex.cpp
   src/features/stereo/stereo.cpp
   src/features/stereo/gpu.cpp
   src/features/stereo/eyestate.cpp
