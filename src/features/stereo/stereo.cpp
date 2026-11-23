@@ -61,7 +61,8 @@ std::mutex g_pmu;
 Params g_p;
 std::atomic<bool> g_packed{false};   // the output is side by side
 std::atomic<int> g_pack{0};          // 0 none, 1 full/sbs (2W swapchain, eyes 1:1), 2 hsbs (W, squeezed)
-std::atomic<bool> g_disabled{false};  // a start-up condition switched stereo off (fg, signatures)
+std::atomic<bool> g_disabled{false};  // a start-up condition switched stereo off (signatures)
+bool g_fg_linked = false;             // frame generation evaluates per eye (fg_stereo_link, start-up)
 
 Params params() {
   Params p;
@@ -735,7 +736,9 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
   int w = rglob<int>(kRvaOutputSize), h = rglob<int>(kRvaOutputSize + 4);
   // Convergence: by default a shift of each finished eye image (after TAA/DLSS, which would partly
   // undo a projection shift; Torchbearer measured that), else in the projection.
-  bool shift_conv = p.conv_shift != 0;
+  // With frame generation the projection (its per-eye DLSS-G features are sized to the eye; an image
+  // shift would re-size them whenever the game's zoom moves the shift; measured equal, docs/stereo.md).
+  bool shift_conv = p.conv_shift != 0 && !g_fg_linked;
   g_shift[0] = g_shift[1] = 0;
   if (shift_conv && p.convergence_m > 0) {
     double ndc = std::fabs(conv_ndc_for(p, view, p.separation_mm / 1000.0));
@@ -1314,13 +1317,15 @@ void stereo_start() {
   // Frame generation (docs/stereo.md "Stereo with frame generation"): FG keeps one input set and
   // DLSS-G feature per eye, told which eye each DLSS evaluation belongs to. Only with a packed output
   // (start-up): without one no frame is side by side, and FG runs exactly as it does alone.
-  if (fg_enabled() && g_pack.load() != 0)
+  if (fg_enabled() && g_pack.load() != 0) {
     fg_stereo_link({[]() -> int {
                       int ph = g_vis_phase.load(std::memory_order_relaxed);
                       if (ph == 0 || GetCurrentThreadId() != g_vis_tid.load(std::memory_order_relaxed)) return -1;
                       return ph == 1 ? 0 : 1;
                     },
                     []() { return g_pair; }});
+    g_fg_linked = true;
+  }
   g_hooked = true;
   TH_LOG("stereo: hooks installed (output %s)", g_output_now.c_str());
 }

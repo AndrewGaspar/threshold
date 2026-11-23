@@ -97,10 +97,10 @@ def main():
         rows = slice(int(H * 0.15), int(H * 0.55))  # above the player and the HUD hint
         eye = lambda img, e: img[:, e * W:(e + 1) * W]
         tot = [shift_x(eye(A, e), eye(C, e), rows)[0] for e in (0, 1)]
-        disp_real = None
+        disp_real = disp_prev = None
         if not a.no_disp:
-            fa = field(eye(C, 0), eye(C, 1), stride=a.stride)
-            disp_real = fa
+            disp_real = field(eye(C, 0), eye(C, 1), stride=a.stride)
+            disp_prev = field(eye(A, 0), eye(A, 1), stride=a.stride)
         for key in sorted(k for k in frames[n] if k != "R"):
             k, mm = key
             G = L(frames[n][key])
@@ -130,6 +130,12 @@ def main():
                     row["disp_median_real"] = round(float(np.median(dr)), 2)
                     row["disp_absdiff_mean"] = round(float(np.mean(np.abs(dg - dr))), 2)
                     row["disp_absdiff_median"] = round(float(np.median(np.abs(dg - dr))), 2)
+                # baseline: how much the real frames' own disparity field moves from R(n-1) to R(n)
+                cb = [p for p in disp_prev if p in disp_real]
+                if cb:
+                    d = np.abs(np.array([disp_prev[p] for p in cb]) - np.array([disp_real[p] for p in cb]))
+                    row["disp_real_vs_prev_mean"] = round(float(d.mean()), 2)
+                    row["disp_real_vs_prev_median"] = round(float(np.median(d)), 2)
             out.append(row)
             print(json.dumps(row))
     if a.json:
