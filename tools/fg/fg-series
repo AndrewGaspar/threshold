@@ -3,7 +3,7 @@
 # Live A/B of [fg] settings in one running session (after Pharos's tools/fg-series): for each spec,
 # sets the keys in the instance's threshold.ini ([fg] section; `quiver lab set --wait`), lets the
 # pacing settle, takes the GPU lock and runs tools/fg/fg-trace, and prints the summary lines.
-# Results: build-fg/fgtrace/PREFIX-LABEL/. Env: DX, PERIOD (spin), PRESENTS, SHOTS, BAND_Y, BAND_H.
+# Results: build-fg/fgtrace/PREFIX-LABEL/. Env: DX, PERIOD (spin), PRESENTS, SHOTS, BAND_Y, BAND_H, SETTLE (s).
 set -uo pipefail
 inst=$1 prefix=$2; shift 2
 here=$(cd "$(dirname "$0")/../.." && pwd)
@@ -15,7 +15,7 @@ for spec in "$@"; do
     quiver lab set "$inst" "install:threshold.ini:[fg]${kv}" --wait >/dev/null || echo "$label: set $kv failed"
   done
   # settle: the interval EMA and count=auto (a few seconds of frames)
-  python3 -I -c 'import time; time.sleep(4)'
+  python3 -I -c "import time; time.sleep(${SETTLE:-4})"
   d=$here/build-fg/fgtrace/$prefix-$label
   timeout 200 quiver lab gpu --for "$inst" -- "$here/tools/fg/fg-trace" "$inst" "$prefix-$label" "${DX:-2}" "${PERIOD:-2}" \
     "${PRESENTS:-480}" "${SHOTS:-240}" > /dev/null 2>&1 || echo "$label: trace failed"

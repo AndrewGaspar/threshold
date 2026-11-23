@@ -1,0 +1,28 @@
+#!/usr/bin/env bash
+# tools/fg/latency INSTANCE LABEL [count=40] [dx=150]
+# Input-to-frame latency on a running game (in the world, camera control): turns the mod's latency
+# log on (`fg latency start`), injects COUNT mouse-look motions of DX px through `quiver lab mouse
+# --repeat` (random 0.4-0.7 s gaps, alternating direction, each send logged in CLOCK_MONOTONIC_RAW),
+# turns the log off and analyses it with tools/fg/latency.py. Run where the instance is (tools/lab/rb
+# on rayblaster), under the GPU lock for timing: quiver lab gpu --for INSTANCE -- tools/fg/latency ...
+# Results: build-fg/latency/LABEL/.
+set -euo pipefail
+inst=$1 label=$2 count=${3:-40} dx=${4:-150}
+here=$(cd "$(dirname "$0")/../.." && pwd)
+export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-fg}
+lab=$HOME/Games/quiver-lab/instances/$inst/lab
+rd=$lab/runs/$(ls -1t "$lab/runs" | head -1)
+out=$here/build-fg/latency/$label
+rm -rf "$out"; mkdir -p "$out"
+rm -f "$rd/latency.csv"
+quiver lab call "$inst" fg latency start >/dev/null
+# --log names a file in the instance's lab folder
+rm -f "$lab/inject-$label.csv"
+quiver lab mouse "$inst" "$dx" 0 --repeat "$count" --gap 0.4-0.7 --log "inject-$label.csv" >/dev/null
+quiver lab call "$inst" fg latency stop --timeout 30 >/dev/null
+cp "$rd/latency.csv" "$out/"
+cp "$lab/inject-$label.csv" "$out/inject.csv"
+grep -E "perf: fg" "$rd/threshold.log" | tail -3 > "$out/perf.txt" || true
+quiver lab host > "$out/host.txt" 2>&1 || true
+echo "##### $label"
+python3 -I "$here/tools/fg/latency.py" "$out/latency.csv" "$out/inject.csv" | tee "$out/report.txt"
