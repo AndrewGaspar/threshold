@@ -540,7 +540,7 @@ std::atomic<double> g_blas_avg{8.0};
 // r41), and dropping their builds left BLASes unbuilt while the TLAS used them (the in-world RT fault,
 // r20-r40). 8 = the same for compaction entries: off by default, running them hung the first teleport
 // (r41: Xid 109).
-std::atomic<int> g_as_once{5};
+std::atomic<int> g_as_once{21};  // 16 when its hooks are in (r50-r51), else 5 with load_mono
 std::atomic<uint64_t> g_n_as_skipped{0}, g_n_refit_skipped{0}, g_n_as_late{0}, g_n_as_extra{0}, g_n_as_new{0}, g_n_as_new_built{0};
 // The job runs on a worker thread, possibly after the render thread has moved on to the right eye, so
 // the eye is the job's order within the pair (reset when the pair starts), not g_vis_phase at run time.
@@ -548,6 +548,35 @@ std::atomic<int> g_as_pair_jobs{2};
 // The left eye's build (+0x40, +0x50) and compaction (+0x60) entries of this pair, sorted.
 constexpr size_t kAsLists[3] = {0x40, 0x50, 0x60};
 std::vector<void*> g_as_left[3];
+// 16 = the right eye shares the left eye's acceleration structures (docs/stereo.md, "Shared acceleration
+// structures"): its RT scene update (renderer+0xa81b0, which empties and refills the job's lists, the
+// instance and per-geometry records, and steps the static-mesh BLAS state machine) is skipped and
+// its render tick (RT+0xd8) undone, and its AS job runs with no instances (so nothing is refit, built
+// or compacted) and without its TLAS build (so the left eye's TLAS, records and shader table stay).
+// Objects the right eye would have listed are listed by the next left update through the engine's
+// own path, so they appear one frame later in both eyes; nothing is marked built without being built.
+std::atomic<uint64_t> g_n_rt_upd_skipped{0}, g_n_tlas_skipped{0}, g_n_left_builds{0}, g_n_left_compactions{0};
+thread_local bool t_tlas_skip = false;
+using RtUpdate_t = void(__fastcall*)(void** p);
+RtUpdate_t o_rtUpdate;
+void __fastcall hk_rtUpdate(void** p) {
+  uint8_t* rt = p && *p ? static_cast<uint8_t*>(*p) : nullptr;
+  if (rt && (g_as_once.load() & 16) && g_vis_phase.load() == 2) {
+    --*reinterpret_cast<uint64_t*>(rt + 0xd8);  // the caller ticked it for this render: one tick per update
+    g_n_rt_upd_skipped++;
+    return;
+  }
+  o_rtUpdate(p);
+}
+using BuildTlas_t = void(__cdecl*)(int, void*, int, void*, void*, bool);
+BuildTlas_t o_buildTlas;
+void __cdecl hk_buildTlas(int flags, void* inst, int n, void* dst, void* scratch, bool update) {
+  if (t_tlas_skip) {
+    g_n_tlas_skipped++;
+    return;
+  }
+  o_buildTlas(flags, inst, n, dst, scratch, update);
+}
 void __fastcall hk_asJob(void** cap) {
   uint8_t* sc = cap && *cap ? static_cast<uint8_t*>(*cap) : nullptr;
   if (!sc) return o_asJob(cap);
@@ -564,6 +593,20 @@ void __fastcall hk_asJob(void** cap) {
   if (k == 0 && g_vis_phase.load() == 2) g_n_as_late++;  // the left eye's job ran after the right eye began
   if (k == 2) g_n_as_extra++;                           // a third job in one pair (not expected)
   int m = g_as_once.load();
+  if ((m & 16) && o_rtUpdate && o_buildTlas) {
+    if (k == 0) {
+      g_n_left_builds += n;
+      g_n_left_compactions += cnt(0x68);
+    }
+    if (k != 1) return o_asJob(cap);
+    uint32_t inst = cnt(0x78);  // > 0 gates the refit/build/compaction/record work in the job
+    cnt(0x78) = 0;
+    t_tlas_skip = true;
+    o_asJob(cap);
+    t_tlas_skip = false;
+    if (cnt(0x78) == 0) cnt(0x78) = inst;
+    return;
+  }
   if (k == 0 && (m & 1)) {  // the left eye's entries, for the right eye's comparison
     for (int l = 0; l < 3; l++) {
       auto& v = g_as_left[l];
@@ -615,8 +658,9 @@ void __fastcall hk_asJob(void** cap) {
 // A level change keeps the frame mono until the engine is done (signals above) and then until no
 // new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
 constexpr uint64_t kSettleMs = 3000, kChangeMaxMs = 90000;
+bool as_shared() { return (g_as_once.load() & 16) && o_rtUpdate && o_buildTlas; }
 bool level_changing() {
-  if (!g_load_mono.load()) return false;
+  if (!g_load_mono.load() || as_shared()) return false;  // with shared AS, level changes stay in 3D
   uint64_t now = GetTickCount64();
   bool busy = false;
   if (void* jp = g_lc_jp.load()) {
@@ -664,6 +708,14 @@ void level_hooks_start() {
   void* aj = reinterpret_cast<void*>(g_rimg.at(0xa89c0));
   if (sig_match(aj, "40 55 56 41 57 48 83 ec 50 48 8b f1 33 ed 8b cd 38 0d ?? ?? ?? ?? 0f 95"))
     hook_fn(aj, (void*)hk_asJob, (void**)&o_asJob, "RT acceleration-structure job (stereo: streaming activity)");
+  void* ru = reinterpret_cast<void*>(g_rimg.at(0xa81b0));
+  void* bt = module_export(kD3D, "?buildTopLevelAccelerationStructure@DeviceUtilRaytracing@d3d@@SAXW4RaytracingAccelerationBuildFlags@2@AEAVNativeBuffer@2@H11_N@Z", "stereo");
+  if (o_asJob && bt && sig_match(ru, "4c 8b dc 55 53 57 41 57 49 8d ab 78 fe ff ff 48 81 ec 68 02 00 00")) {
+    hook_fn(ru, (void*)hk_rtUpdate, (void**)&o_rtUpdate, "RT scene update (stereo: shared acceleration structures)");
+    hook_fn(bt, (void*)hk_buildTlas, (void**)&o_buildTlas, "d3d buildTopLevelAccelerationStructure (stereo: shared acceleration structures)");
+  } else {
+    TH_LOG("stereo: RT scene update / TLAS build not matched: as_once 16 unavailable");
+  }
   g_onIsLoading = reinterpret_cast<uintptr_t>(
       module_export(kCore, "?onIsLoading@coregame@@3V?$function@$$A6A_NXZ@std@@A", "stereo"));
 }
@@ -1068,7 +1120,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1076,7 +1128,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_rt_upd_skipped.load(), (unsigned long long)g_n_tlas_skipped.load(), (unsigned long long)g_n_left_builds.load(), (unsigned long long)g_n_left_compactions.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
@@ -1226,7 +1278,7 @@ void stereo_register() {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
     } else if (id == "stereo.as_once") {
-      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 5 : atoi(v.c_str());
+      g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 21 : atoi(v.c_str());
     } else if (id == "stereo.video_once") {
       g_video_once = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.load_mono") {
