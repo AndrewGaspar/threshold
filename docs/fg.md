@@ -420,7 +420,6 @@ installed with `enabled = 1`.
 ## Resume notes (2026-11-23, branch `wip/fg-latency-reflex`)
 
 Done: 7 (headroom cap, default off), 8 (latency), 9 (Reflex injection, default off; works, no
-measured effect at these frame rates). Instance `control-fg` on rayblaster is left at the heavy setting
-of 9 (render 2880x1620, RT on; SDR 1920x1080@165); put renderer.ini back to 1280x720 / RT off for
-the pacing tools' standard scene. Commands as before (`tools/fg/launch`, `tools/lab/rb
+measured effect at these frame rates). Instance `control-fg` on rayblaster is down, back on the
+standard scene settings (SDR 1920x1080@165, render 1280x720, RT off). Commands as before (`tools/fg/launch`, `tools/lab/rb
 tools/fg/fg-series`, `tools/lab/rb tools/fg/latency-series`, `tools/fg/latency-table.py`).
