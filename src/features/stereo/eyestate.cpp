@@ -252,7 +252,7 @@ using Prepare_t = void(__fastcall*)(void*);
 struct RightSet {
   uint8_t graph[16]{};  // the persisted-resource vector header
   int graph_w = 0, graph_h = 0;
-  void* dlf[4]{};
+  void* dlf[kDlfHistories]{};
   void* ssao_obj = nullptr;
   void* ssao[6]{};
   void* vol_obj = nullptr;
@@ -355,7 +355,8 @@ void hist_enter(void* r) {
     memcpy(g_ls.graph, gp, 16);
     memcpy(gp, g_rs.graph, 16);
   }
-  for (int i = 0; i < 4 && (m & 2); i++) {
+  for (size_t i = 0; i < kDlfHistories; i++) {
+    if (!(m & (i < 4 ? 2 : 32))) continue;
     void*& g = *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i]));
     g_ls.dlf[i] = g;
     g = g_rs.dlf[i];
@@ -404,7 +405,8 @@ void hist_leave(void* r) {
     memcpy(g_rs.graph, gp, 16);
     memcpy(gp, g_ls.graph, 16);
   }
-  for (int i = 0; i < 4 && (m & 2); i++) {
+  for (size_t i = 0; i < kDlfHistories; i++) {
+    if (!(m & (i < 4 ? 2 : 32))) continue;
     void*& g = *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i]));
     g_rs.dlf[i] = g;
     g = g_ls.dlf[i];
@@ -599,7 +601,7 @@ void* eyestate_texture(const std::string& kind, int i) {
     if (*reinterpret_cast<int*>(e + kGraphEntryType) != 0) return nullptr;
     return gpu_native(*reinterpret_cast<void**>(e + kGraphEntryRes));
   }
-  if ((kind == "dlfL" || kind == "dlfR") && i < 4) {
+  if ((kind == "dlfL" || kind == "dlfR") && size_t(i) < kDlfHistories) {
     void* t = kind == "dlfL" ? *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i])) : g_rs.dlf[i];
     return t ? gpu_native(t) : nullptr;
   }
