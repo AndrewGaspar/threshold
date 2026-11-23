@@ -37,6 +37,7 @@
 #include "core/module.h"
 #include "core/present.h"
 #include "core/quiver.h"
+#include "features/fg/fg.h"
 #include "features/stereo/engine.h"
 #include "features/stereo/eyestate.h"
 #include "features/stereo/gpu.h"
@@ -60,7 +61,8 @@ std::mutex g_pmu;
 Params g_p;
 std::atomic<bool> g_packed{false};   // the output is side by side
 std::atomic<int> g_pack{0};          // 0 none, 1 full/sbs (2W swapchain, eyes 1:1), 2 hsbs (W, squeezed)
-std::atomic<bool> g_disabled{false};  // a start-up condition switched stereo off (fg, signatures)
+std::atomic<bool> g_disabled{false};  // a start-up condition switched stereo off (signatures)
+bool g_fg_linked = false;             // frame generation evaluates per eye (fg_stereo_link, start-up)
 
 Params params() {
   Params p;
@@ -776,7 +778,9 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
   int w = rglob<int>(kRvaOutputSize), h = rglob<int>(kRvaOutputSize + 4);
   // Convergence: by default a shift of each finished eye image (after TAA/DLSS, which would partly
   // undo a projection shift; Torchbearer measured that), else in the projection.
-  bool shift_conv = p.conv_shift != 0;
+  // With frame generation the projection (its per-eye DLSS-G features are sized to the eye; an image
+  // shift would re-size them whenever the game's zoom moves the shift; measured equal, docs/stereo.md).
+  bool shift_conv = p.conv_shift != 0 && !g_fg_linked;
   g_shift[0] = g_shift[1] = 0;
   if (shift_conv && p.convergence_m > 0) {
     double ndc = std::fabs(conv_ndc_for(p, view, p.separation_mm / 1000.0));
@@ -882,6 +886,7 @@ void __fastcall hk_renderHUD(void* r) {
     if (s >= 0) eng_copy(sn, e * w + s, 0, src, 0, 0, w - s, h);
     else eng_copy(sn, e * w, 0, src, -s, 0, w + s, h);
   }
+  fg_stereo_hudless(r, sn);  // frame generation: both eyes before the HUD (inert with [fg] off)
   at<void*>(r, kRCreatedColor) = sbs;
   uint8_t owned = at<uint8_t>(r, kRCreatedOwned);
   at<uint8_t>(r, kRCreatedOwned) = 0;
@@ -924,6 +929,10 @@ void __fastcall hk_end(void* r) {
     eng_copy(sn, w, 0, cc, 0, 0, w, h);
     g_n_mono_dup++;
   }
+  // Frame generation evaluates each eye in its half (inert with [fg] off).
+  if (g_composed) fg_stereo_frame(pack, w, std::max(-(w - 1), std::min(w - 1, g_shift[0])),
+                                  std::max(-(w - 1), std::min(w - 1, g_shift[1])), true);
+  else fg_stereo_frame(pack, w, 0, 0, false);
   g_composed = false;
   uint8_t owned = at<uint8_t>(r, kRCreatedOwned);
   at<void*>(r, kRCreatedColor) = sbs;
@@ -1298,23 +1307,6 @@ void stereo_start() {
     std::lock_guard lk(g_pmu);
     if (g_output_now.empty()) apply_output_locked();  // no [stereo] output key: auto
   }
-  // Stereo and frame generation are not combined (yet): with [fg] enabled, stereo stays off.
-  if (cfg_bool("fg.enabled", false)) {
-    {
-      std::lock_guard lk(g_pmu);
-      bool wanted = g_p.mode != Mode::Off;
-      g_disabled = true;
-      g_packed = false;
-      g_pack = 0;
-      g_tag_layout.clear();
-      update_tag();
-      if (wanted)
-        TH_LOG("stereo: [fg] enabled = 1: stereo stays off (frame generation and stereo are not combined; set "
-               "[fg] enabled = 0 for 3D)");
-    }
-    present_set_width_scale(1);
-    return;
-  }
   if (!check_build()) {
     std::lock_guard lk(g_pmu);
     g_disabled = true;
@@ -1364,6 +1356,18 @@ void stereo_start() {
   if (g_output_now == "full") window_start();
   present_on(on_present);
   hypr_start();
+  // Frame generation (docs/stereo.md "Stereo with frame generation"): FG keeps one input set and
+  // DLSS-G feature per eye, told which eye each DLSS evaluation belongs to. Only with a packed output
+  // (start-up): without one no frame is side by side, and FG runs exactly as it does alone.
+  if (fg_enabled() && g_pack.load() != 0) {
+    fg_stereo_link({[]() -> int {
+                      int ph = g_vis_phase.load(std::memory_order_relaxed);
+                      if (ph == 0 || GetCurrentThreadId() != g_vis_tid.load(std::memory_order_relaxed)) return -1;
+                      return ph == 1 ? 0 : 1;
+                    },
+                    []() { return g_pair; }});
+    g_fg_linked = true;
+  }
   g_hooked = true;
   TH_LOG("stereo: hooks installed (output %s)", g_output_now.c_str());
 }

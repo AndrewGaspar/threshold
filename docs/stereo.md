@@ -4,7 +4,8 @@
 > **Open:** with ray tracing on, 3D play (sbs, and even `mode = left`) still faults the GPU after
 > seconds to minutes in the world (rayblaster r20-r37; mono passes): see "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
-> both eyes by default (`hdr_hud_wide`).
+> both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
+> per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -42,7 +43,7 @@ left, right eye right, the HUD hint in both halves.*
 | HDR: HUD in both eyes | done (`hdr_hud_wide`: the UI target 2W wide) | live, rayblaster r3/r15/r18 (r25's laptop hang was the wedged driver) |
 | Separation, convergence (image shift in sbs, projection in left/right), swap eyes | done, live | measured |
 | `mode = auto`, `output = auto`, Hyprland window tag, Quiver stereo layout | done | live in the lab only without Hyprland (auto → off/none); HypXRland not tested |
-| Frame generation at the same time | stereo stays off (logged); design below | live |
+| Frame generation at the same time (2x-4x, per eye: two DLSS-G features, per-eye inputs, HUD-less from the side-by-side texture) | done | measured, rayblaster r4-r5, "Stereo with frame generation" |
 | Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once`: right eye skips BLAS build/compaction) | live, rayblaster r18 (HDR) + r19 (SDR), "Level-change hang" |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
@@ -179,7 +180,8 @@ Disparity `K = 2·e·m00·W/2` = 97.95 px·m at 32.5 mm, m00 1.5697, W 1920.
   applied: the 24.49 px total rounded and split 12/12) → Zc = 4.08 m for 4 set.
 - **hsbs** (r13): 1920x1080 swapchain, both eyes squeezed, HUD in both; disparity in squeezed
   pixels 4.07 px median (full width 9.07).
-- **FG enabled** (r14): `stereo: [fg] enabled = 1: stereo stays off`, swapchain not widened.
+- **FG enabled** (r14, before frame generation was combined): `stereo: [fg] enabled = 1: stereo stays off`.
+  Now both run: "Stereo with frame generation".
 - **Inert** (r17, shipped defaults, no Hyprland): `output auto -> none`, mode resolves to off; the
   hooks pass through and no GPU resources or command-list hooks are created.
 - Live switching sbs ↔ off ×4 (r15): right-eye DLSS features created 3, released 2 (+1 in use),
@@ -327,40 +329,153 @@ scRGB; the side-by-side texture follows the colour target's format (engine forma
 - Per-eye output: captures are linear FP16; `stereo_sbs.py raw` decodes them (also R11G11B10 and
   R10G10B10A2), and BMP captures of FP16 are now clamped and gamma-encoded instead of garbled.
 
-## Stereo with frame generation (design, not implemented)
+## Stereo with frame generation
 
-Today `[fg] enabled = 1` keeps stereo off (stereo_start). The FG feature (src/features/fg/, another
-agent's, changing as of this writing: `engine.cpp`/`trace.cpp` were added and `fg.cpp` edited within
-the last hour) taps the game's one DLSS-SR evaluation per frame (`NVSDK_NGX_D3D12_EvaluateFeature_C`
-hook: depth, MVs, jitter), reads the main view's camera inside it, takes the HUD-less colour at
-`renderHUD` entry (vtable slot 17 patch) and presents the real frame plus N generated ones from proxy
-back buffers. In sbs there are two SR evaluations per update (the engine's feature, then the
-right-eye feature `eyestate.cpp` swaps in), one `renderHUD` on the 2W texture, and one 2W Present.
+Both run at once: `[fg] enabled = 1` with `mode = sbs` and a packed output. Approach 2 of the former
+design, per eye: two DLSS-G features, each fed its own eye's depth, motion vectors, jitter, camera and
+HUD-less colour, each evaluated in its eye's half of the shared 2W textures. Code: `src/features/fg/fg.cpp`
+(`frame_views`, `evaluate`), `engine.cpp` (HUD-less, `camera_crop`), stereo's side in `stereo.cpp`
+(`fg_stereo_link`, `fg_stereo_hudless`, `fg_stereo_frame`; FG's API in `fg.h`). How FG itself works:
+[`fg.md`](fg.md), section "Stereo".
 
-Two shapes:
-1. **DLSS-G on the composed SBS frame** (one feature, 2W): cheapest, but DLSS-G takes one camera
-   (view/clip matrices, position, basis) per frame and its optical flow and MV warp would run across
-   the seam between the halves: motion near x = W would pull pixels from the other eye, and the
-   right half's camera data would be the left eye's. Rejected.
-2. **Per eye (recommended)**: two DLSS-G features, one per eye, each evaluated with its eye's own
-   inputs and a sub-rectangle of the shared 2W buffers (DLSS-G's `*SubrectBase/Size` parameters):
-   - depth/MVs: FG's Eval tap keeps one input set per eye, keyed by which SR feature was evaluated
-     (stereo exposes the right-eye handle, or simply "eye 0/1 of this update");
-   - camera: per eye (FG's `camera_read` inside each eye's world render already sees that eye's
-     main view; with an eye index it keeps two);
-   - HUD-less colour: stereo's two eye textures before the HUD (they exist: `Threshold::stereoEyeL/R`)
-     or the 2W texture before the HUD, sub-rect per eye;
-   - final colour and outputs: the 2W proxy back buffer, sub-rect per eye; the N generated frames are
-     2W and present as they are (both eyes of generated frame i together).
-   Cost: two DLSS-G evaluations per real frame on top of two world renders (sbs already halves the
-   base rate, which is where FG helps most).
+How it fits together (static, from the code; every point verified live below):
+- **Inputs per eye.** Each eye's world render evaluates its own DLSS SR feature (the engine's for the
+  left eye, `eyestate.cpp`'s for the right). FG's Eval tap asks stereo which eye it is in (the pair's
+  phase on the renderer thread) and keeps one depth/MV copy, jitter, MV scale and camera per eye. The
+  camera is read inside that eye's render, so it is the eye's moved view with the eye's own previous
+  matrices (per-eye `storePrevious`, "Per-eye temporal state").
+- **Two features.** DLSS-G keeps the previous frame inside the feature; one feature evaluated for both
+  eyes interpolates between the other eye's previous image and this eye's (measured below:
+  `stereo_features = 1`). Feature 0 is the left eye's, feature 1 the right eye's, both created at one
+  eye's size.
+- **Sub-rectangles** (`DLSSG.InputBackbufferSubrect*`, `OutputInterpolatedSubrect*`,
+  `HUDLessSubrect*`, `DepthSubrect*`, `MVecsSubrect*`; names from
+  `third_party/DLSS-310.9.16/include/nvsdk_ngx_defs_dlssg.h`): the left eye x 0..W, the right eye
+  W..2W, of the one 2W real frame, HUD-less copy and output texture; depth and MVs are each eye's own
+  render-size textures. `DLSSG.EvalFlags = UpdateOnlyInsideExtents`: by default DLSS-G also writes the
+  uninterpolated backbuffer *outside* the sub-rectangle, which would overwrite the other eye's half.
+- **HUD-less.** Stereo hands FG the side-by-side texture after both eyes are copied in and before the
+  HUD is drawn (`fg_stereo_hudless` in stereo's `renderHUD`). FG's own renderHUD tap then leaves the
+  copy to it (it would otherwise copy the one-eye colour target). The FG tap is a vtable patch that
+  chains into stereo's inline detour of the same function; its signature check now accepts a body
+  that jumps into our own module, which is stereo's detour.
+- **Layout per frame.** Stereo's `end` reports each packed frame (`fg_stereo_frame`: pack, eye width,
+  shifts, pair or mono duplicate). A frame without a pair (one image in both halves) gives both views
+  the one input set. A frame stereo doesn't report is evaluated whole, as without stereo.
+- **Convergence goes into the projection while FG is linked.** DLSS-G refuses a backbuffer
+  sub-rectangle narrower than the feature (`0xBAD00005`, live r2). So with the image-shift convergence
+  (the eye images moved by ∓12 px, uncovered columns black) each feature had to be created at the
+  shown width (1908-1910 px) with depth, MVs and camera cropped to match (`camera_crop`). That works
+  (measured r4, below), but the shift follows the game's animated zoom, so the features were
+  re-created 9 times in the first 2 s of play (13-24 ms each, history lost), and would be again on
+  every aim. The projection convergence measures the same here (below), so stereo uses it while FG is
+  linked: no crop, features at the full eye width, created once. FG keeps the crop path for a
+  reported shift.
+- **Not linked** when the output isn't packed (`output = none`, the default off HypXRland): FG then
+  runs exactly as alone.
 
-The API it needs from FG is small but touches its core loop: (a) `fg_set_views(2)` before the
-swapchain exists; (b) an eye index for the current SR evaluation and camera read (a callback stereo
-registers: `int (*)()` returning 0/1, or -1 when not in a pair); (c) per-view sub-rects for the
-evaluate. Stereo's side: stop refusing FG, provide the eye callback and the HUD-less eye textures.
-Not implemented: FG is not settled, and (a)-(c) mean two features and two input sets inside
-`fg.cpp`, not a thin callback.
+![both eyes with 4x frame generation](img/stereo-fg-4x.jpg)
+
+*3840x1080 (downscaled), `mode = sbs`, `[fg] count = 4` (r5, 285 presents/s from 71 rendered with
+another instance loading the GPU): left eye left, right eye right, the HUD hint in both.*
+
+Measured on rayblaster (instance `control-sfg`: GE-Proton11-12, display 3840x1080@120 so `output =
+full` widens the window to both eyes 1:1; renderer.ini DLSS Quality 1280x720 → 1920x1080 per eye,
+**all RT effects off**, motion blur and film grain off; lobby from the `game-start` fixture; 32.5 mm,
+convergence 4 m unless noted). Captures: `fg grab N TAG` (FG's verb: the real frame and every
+generated frame of N consecutive jobs, whole, exactly what is presented) through `tools/fg/stereo-grab`
+(optionally while `tools/fg/spin.py` turns the camera, 2 px of mouse-look per 2 ms), analysed by
+`tools/fg/stereo-gen.py`. Per eye half: the generated frame's horizontal shift from R(n−1) over
+R(n−1)→R(n) by phase correlation (expected k/m), its per-patch stereo disparity (L half vs R half)
+against the real frame's, and as a baseline how much the real frames' own disparity field moves from
+R(n−1) to R(n).
+
+| run | config | shift ratio L / R (expected) | disparity median G / real | per-patch \|G − real\| median | baseline R(n−1)→R(n) |
+|---|---|---|---|---|---|
+| r4 s2x | 2x, image-shift convergence (crop 1908-1909 px) | 0.498 / 0.499, 0.502 / 0.498 (0.5) | −16.64 / −16.28, −16.38 / −16.25 px | 0.14, 0.16 px | 0.16, 0.20 px |
+| r4 s4x | 4x, image shift | 0.257 / 0.242, 0.501 / 0.473, 0.753 / 0.746; 0.253 / 0.252, 0.499 / 0.504, 0.747 / 0.746 | −15.31 / −15.13 ... | 0.08-0.19 px | 0.19, 0.23 px |
+| r4 c0pe | 2x, convergence 0, per-eye features | 0.501 / 0.501, 0.505 / 0.505 | 11.05 / 11.17, 10.86 / 10.88 px | 0.14, 0.16 px | 0.22, 0.26 px |
+| r4 c0sh | **negative control**: one feature for both eyes (`[fg] stereo_features = 1`) | 0.494 / **0.959**, 0.510 / **0.966** | **23.19** / 12.17, **22.93** / 12.34 px | **17.6, 18.5 px** | 0.37, 0.40 px |
+| r5 p2x | 2x, projection convergence (the default with FG) | 0.502 / 0.505, 0.510 / 0.504 | −14.40 / −14.40, −15.08 / −14.66 px | 0.41, 0.49 px | 0.46, 0.54 px |
+| r5 p4xb | 4x, projection | 0.251 / 0.251, 0.500 / 0.501, 0.750 / 0.751 | −11.93 / −12.00 ... | 0.27-0.52 px | 0.65 px |
+
+- **Each eye's generated frames are that eye's.** Both eyes interpolate at k/m, and the disparity of
+  generated frames equals the real frames' to within the real frames' own frame-to-frame change.
+  With one shared feature the right eye's "generated" frame is 96 % of the way to the next frame
+  (it interpolates from the left eye's image) and its disparity is off by 18 px per patch: the
+  metric sees cross-eye mixing when it is there.
+- **Still scene** (no input; r4 s4still, r5 p4stillb, 4x): generated vs real of the same eye 0.03-0.40/255
+  mean, vs the other eye's real half 5.8-11.4/255; disparity identical (median |diff| 0.00 px).
+- One r5 p4xb triplet had ratios near 0 in the left eye at 1/4 and 2/4 (0.5 in the right at 2/4).
+  It spans a 107 px jump between real frames (a hitch); the phase peaks were weak (0.09-0.12 vs >0.3
+  normally) and both eyes' errors to R(n−1)/R(n) were equal (6.53/6.54, 8.73/8.77, 10.23/10.17): a
+  measurement miss, not an eye difference.
+- **HUD in both eyes** (screenshots r2 2x, r5 4x; captures): on the "W, A, S, D Move" hint's 3827
+  glyph pixels, generated vs real 0.12-0.18/255 in each eye during the spin (r4 s4x), 0.05-0.09/255
+  over the hint box when still.
+- **Uncovered columns** (image-shift convergence, r4): columns 1908..1931 black in the real frame and
+  in every generated frame (copied from the real frame). The 40 columns at each eye's inner edge have
+  the same error against the real neighbours as the interior (6.24 vs 4.24 with a motion of 10.89 vs
+  7.77, 3.51 vs 4.01; i.e. 0.57 / 0.55 / 0.69 / 0.57 of the real-to-real change): no seam bleed.
+- **Convergence** (r4, still, 2x): parallel − converged, median disparity 7.18 − (−16.64) = **23.82 px**
+  with the image shift, 7.18 − (−16.68) = **23.86 px** in the projection (expected 2·12.24 at 4 m).
+  Generated frames carry the same disparity (|diff| median 0.00 px).
+- **HDR** (r8: `display.hdr=on`, renderer.ini `m_eAllowHDR 1`; the game rendered at 1920x1080 per eye
+  that run, i.e. DLAA; 4x): FP16 scRGB swapchain, both eyes' generated frames through FG's PQ
+  conversion (`docs/fg.md` 6). Spin: ratios 0.252 / 0.252, 0.500 / 0.500, 0.747 / 0.745 and 0.246 /
+  0.246, 0.491 / 0.491, 0.737 / 0.737; disparity |G − real| median 0.50-0.97 px against a baseline of
+  0.67 / 0.94 px. Still: same eye 0.09/255, other eye 7.43/255. Generated FP16 frames have no NaN/Inf
+  and the real frame's statistics (mean R 0.0852 vs 0.0853, max 2.49 both). HUD in both eyes: the
+  hint's 3942 glyph pixels at 155 nits in each eye, generated vs real 0.005 (0.4 nits). Real fps were
+  52-54 (DLAA, 4x, the other lab instance unthrottled; not a timing figure).
+- **`output = hsbs`** (r9, smoke test; on this 3840-wide display the engine rendered each eye at
+  3840x1080 and `end` squeezed them into 1920 halves of a 3840 swapchain): features at the half's
+  width (1920), depth/MVs whole; ratios 0.497 / 0.499 and 0.473 / 0.475, disparity G / real −5.95 /
+  −5.66 and −6.04 / −5.81 px. No HUD-less in hsbs (the side-by-side texture is 2W, the frame W).
+- **Level changes with 3D + FG** (r10, SDR, RT off; `re/scripts/stereo_rb_fg_levels.sh`, run twice in the
+  same session): 4x, 6 teleports (mail-room, executive-corridor, cafeteria, motel, dead-letters,
+  entry-lobby) and a checkpoint restart, then 2x and 2 teleports; 20 level changes in all.
+  - The FG features were created once per eye at start and never re-created or released (`CreateFeature(FrameGeneration` 2 in the log, 0 evaluate errors, `fail 0 dropped 0` after every
+    change); pairs advanced throughout (9764 → 72325), multiplier 4.0 / 2.0 after each change.
+  - Right after each change (the first jobs, `fg grab 2`, player idle): generated vs real of the same
+    eye ≤ 1.08/255, vs the other eye ≥ 1.70/255 (dead-letters, a dark room; elsewhere 3.9-10.1),
+    disparity of generated frames equal to the real frames' (median |diff| ≤ 0.02 px). Screenshots
+    after every change: both eyes correct, HUD in both.
+  - No Xid from this run. One `signaller_worker` timeout in its game.log at 07:42:20, one second
+    before an `Xid 109` (07:42:21) of pid 899329, which was the other lab instance's game
+    (`control-stereo` r42, RT on: 56 timeouts, relaunched at 07:45; this run's game was pid 1054272
+    throughout). The second pass (07:47-07:53) added no timeout and no Xid.
+- **Each alone is unchanged** (same build, r6/r7):
+  - FG off, `mode = sbs`, `output = full` (r6): 22721 pairs, HUD in both halves, image-shift
+    convergence ∓12 px as before (screenshot: the black seam columns), `fg status` enabled false, no
+    FG texture or feature, no stereo link.
+  - FG on, stereo at its defaults (`mode = auto`, `output = auto` → `none`, r7): stereo's hooks pass
+    through (0 pairs), no link (`stereo_link` false, no `fg: stereo linked`), one DLSS-G feature over
+    the whole frame, the HUD-less tap patched through stereo's pass-through detour (`HUD-less: ...
+    patched`, HUD-less texture made): 165.7 + 165.7 = 331.3 presents/s at 2x, perf line as before (no
+    per-eye field). Before this branch stereo installed no hooks at all with `[fg] enabled = 1`; now
+    its hooks are installed and pass through, as they do whenever stereo is off.
+- Feature creation (log): one per eye with projection convergence for the whole run (`CreateFeature(
+  FrameGeneration 1920x1080 ...)` + `right eye`, 15-20 ms); 13 creations in r4 with the image shift.
+
+**Frame rate and pacing** (r5, **each trace under `quiver lab gpu`**, which throttled the other lab
+instance on the GPU, `control-stereo`; `tools/fg/fg-series control-sfg t1 ...` run on rayblaster, the
+`fg trace` band spanning both eyes, its two phase-correlation sub-bands at 4-36 % and 64-96 % of the
+width, i.e. one in each eye; `[fg] active = 0` is the same proxy path without generation; interleaved
+off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
+
+| trace | rendered fps (both eyes per frame) | presents/s | DLSS-G done after the game's Present | present-call interval sd | shift ratio per index (sd) | position residual, VRR model mean / p90 |
+|---|---|---|---|---|---|---|
+| off / off2 | 136.1 / 132.6 | same | | 1.14 / 1.12 ms | | 3.97 / 8.20, 3.51 / 7.40 px |
+| x2 / x2b | 121.8 / 128.3 (perf 126-131) | 243.5 / 256.7 (perf 253-262) | 2.48-2.50 ms | 0.67 / 0.69 ms | 0.500 (0.011), 0.500 (0.009); 0 of 238 outside [0,1] | 3.37 / 6.84, 2.71 / 4.91 px |
+| x4 / x4b | 121.4 / 123.8 (perf 120-125) | 485.5 / 495.0 (perf 478-500) | 3.84-3.94 ms | 0.37 / 0.47 ms (G→G 0.17 / 0.10) | x4: 0.249 / 0.498 / 0.747 (0.04, 0.03, 0.04; 1 of 351 outside); x4b: **0.250 / 0.500 / 0.749 (0.002, 0.001, 0.002)** | 1.56 / 3.07, 1.83 / 3.86 px |
+
+- The rendered rate drops 4-8 % at 2x and ~10 % at 4x for the two DLSS-G features (two evaluations per
+  generated frame); the game never waited for the present thread (0 in every perf line). Presents are
+  ~1.9x / ~3.6x the 3D rate without FG.
+- Sbs already halves the base rate (docs/stereo.md "Cost"), which is where FG helps most: here 3D at
+  ~130 rendered fps shows ~250 / ~490 presents/s.
+- Absolute fps are this RTX 5090 at 1280x720 render per eye with RT off; not a laptop figure.
 
 ## Options (`[stereo]`, Quiver page "Stereoscopic 3D")
 
@@ -381,7 +496,7 @@ Not implemented: FG is not settled, and (a)-(c) mean two features and two input 
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
-| dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection); synthetic yaw °/update |
+| dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection; with frame generation always the projection); synthetic yaw °/update |
 
 `output = auto` (start-up): on a HypXRland stereo display `sbs` if the larger-swapchain Proton is in
 use (`PROTON_ENABLE_WAYLAND=1` and `WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1`), else `hsbs`; elsewhere
@@ -389,6 +504,10 @@ use (`PROTON_ENABLE_WAYLAND=1` and `WINE_VULKAN_ALLOW_LARGER_SWAPCHAIN=1`), else
 packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each second).
 
 ## Open issues
+
+- **Stereo + FG** (works, measured above, including 20 level changes): not tested with RT on (the RT
+  fault below comes first) or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
+  rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
 - **GPU fault in 3D play with ray tracing** (MMU fault, one shader, minutes into play; mono is fine):
   see "Level-change hang" for the bisect so far. Workaround: RT off in 3D.
@@ -624,6 +743,20 @@ session state) is not needed if this works.
 Tools: `[stereo] fence_trace = 1` (start-up) logs FenceUtil waits/signals plus the queue vtable's
 Signal/Wait/ExecuteCommandLists. `stereo fences N` dumps the last N events to threshold.log, marking
 waits never satisfied as `STUCK`.
+
+### Resume notes: stereo + frame generation (2026-11-23, branch `wip/stereo-fg`)
+
+- **State.** Implemented and measured (section "Stereo with frame generation"). Lab instance
+  `control-sfg` on rayblaster (display 3840x1080@120, SDR: `display.hdr=off`, renderer.ini
+  `m_eAllowHDR 0`, RT off, DLSS Quality 1280x720 → 1920x1080) is down. Its first launch writes renderer.ini;
+  edit it in `~/Games/quiver-lab/instances/control-sfg/install/` while the game isn't running.
+- **Drive.** `tools/lab/moddir OUT fg.enabled=1 stereo.mode=sbs stereo.output=full fg.count=2`, then
+  `Q="quiver --machine rayblaster" tools/fg/launch control-sfg OUT` (into the lobby, cinematics
+  skipped), `tools/fg/stereo-grab control-sfg DIR TAG [jobs] [spin_dx]` (grab + analysis), and for
+  pacing `tools/fg/fg-series` run on rayblaster from a synced copy (`~/threshold-sfg`, not
+  `~/threshold-lab`, which another session's `rb-sync --delete` owns).
+- **Next.** RT on once the RT fault is fixed; latency (`tools/fg/latency`) in 3D. Level changes:
+  `re/scripts/stereo_rb_fg_levels.sh OUT` on a running `control-sfg` (passed, r10).
 
 ## Reproducing
 

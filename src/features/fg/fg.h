@@ -21,5 +21,30 @@ namespace th {
 // and pacing are live.
 void fg_register();
 void fg_start();
+bool fg_enabled();  // [fg] enabled at start (after fg_start)
+
+// Stereo 3D with frame generation (docs/stereo.md "Stereo with frame generation", docs/fg.md
+// "Stereo"). Stereo renders both eyes in one engine frame and presents them side by side; FG then
+// keeps one input set (depth, MVs, jitter, camera) and one DLSS-G feature per eye, and evaluates each
+// eye in its own sub-rectangle of the shared side-by-side textures. Stereo registers its side at
+// start and reports each frame's layout; without it (or in a frame it doesn't report) FG works on
+// the whole frame as before.
+struct FgStereoLink {
+  // Renderer thread, inside a world render (the DLSS evaluate tap): 0 / 1 = the left / right eye of a
+  // side-by-side pair, -1 = not a pair (one render this frame).
+  int (*eye)();
+  // renderHUD entry (FG's HUD-less tap): true when stereo is about to compose a pair and will hand the
+  // side-by-side texture over with fg_stereo_hudless instead.
+  bool (*hud_pending)();
+};
+void fg_stereo_link(const FgStereoLink& link);
+// Stereo's renderHUD, after both eyes are in the side-by-side texture (d3d::NativeTexture*) and
+// before the HUD is drawn into it: the HUD-less colour of the whole 2W frame.
+void fg_stereo_hudless(void* renderer, void* sbs_nt);
+// Stereo's `end`, for every frame it blits with a packed output: pack 1 = a 2W back buffer (each eye
+// 1:1), 2 = W (eyes squeezed 2:1); w = one eye's width (the engine's output size); shift = each eye
+// image's horizontal shift in the frame (convergence, eye pixels); pair = both eyes rendered (false:
+// one image in both halves).
+void fg_stereo_frame(int pack, int w, int shift_left, int shift_right, bool pair);
 
 }  // namespace th

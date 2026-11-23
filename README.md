@@ -22,7 +22,8 @@ Remastered, the same engine family) and Pharos (Assassin's Creed Origins).
 - **Same-frame stereoscopic 3D**: both eyes are rendered from one game update and composed side by
   side (full or half SBS, automatic on a HypXRland stereo output). Temporal state is kept per eye
   (DLSS, TAA, motion, RT denoisers), with separation, convergence and eye swap. See
-  [`docs/stereo.md`](docs/stereo.md). **Known issue:** with ray tracing on, 3D faults the GPU after
+  [`docs/stereo.md`](docs/stereo.md). Frame generation works in 3D too: one DLSS-G feature per eye,
+  each with its own eye's depth, motion vectors and camera. **Known issue:** with ray tracing on, 3D faults the GPU after
   seconds to minutes in the world; turn ray tracing off in 3D until that's fixed.
 - **Current DLSS models**: ships DLSS 310.9.16, so Quiver's *DLSS Super Resolution model* tweak can
   select the DLSS 4.5 presets M/L. It also turns off the game's default legacy (CNN) model.
