@@ -18,6 +18,17 @@ for k in Return Return Escape Return; do
   $Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 4 >/dev/null 2>&1 || true
   $Q lab key "$inst" "$k" >/dev/null
 done
+# The DLC panel sometimes takes the Return meant for Continue: if no player shows up, close it and
+# press Continue again.
+end=$((SECONDS + 40))
+until $Q lab where "$inst" >/dev/null 2>&1 || ((SECONDS > end)); do
+  $Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 3 >/dev/null 2>&1
+done
+if ! $Q lab where "$inst" >/dev/null 2>&1; then
+  $Q lab key "$inst" Escape >/dev/null
+  $Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 3 >/dev/null 2>&1
+  $Q lab key "$inst" Return >/dev/null
+fi
 $Q lab call "$inst" skip for=120 >/dev/null 2>&1 || echo "no skip verb"
 end=$((SECONDS + 240))
 until $Q lab where "$inst" 2>/dev/null | grep -q '"control":true' || ((SECONDS > end)); do

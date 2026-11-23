@@ -30,6 +30,7 @@
 #include "features/fg/engine.h"
 #include "features/fg/hdr.h"
 #include "features/fg/latency.h"
+#include "features/fg/reflex.h"
 #include "features/fg/trace.h"
 
 namespace th::fg {
@@ -191,7 +192,7 @@ struct State {
   std::atomic<unsigned> count_min{2}, count_max{4};
   std::atomic<double> target_hz{0};       // [fg] target_hz: presents/s to aim for (0 = the display refresh)
   std::atomic<double> fps_limit{0};       // [fg] fps_limit: rendered frames/s cap (0 = none; auto sets its own)
-  std::atomic<bool> auto_cap{true};       // [fg] auto_cap: headroom cap (Pharos), with the refresh cap
+  std::atomic<bool> auto_cap{false};      // [fg] auto_cap: headroom cap (Pharos), with the refresh cap
   std::atomic<double> auto_cap_lag{0.7};  // [fg] auto_cap_lag: DLSS-G done after the game's Present, in frames
   double head = 0;                        // the headroom cap (fps; 0 = not yet set)
   int64_t fg_since = 0;                   // first frame of the current run of generated frames
@@ -885,6 +886,7 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   if (!S.enabled || !S.sc || sc != (IDXGISwapChain*)S.sc || !S.proxy[0].r) return false;
   if (!real_buffers()) return false;
   detect_refresh();
+  reflex_present_begin(S.dev);
   // Which proxy did the engine just render? Its own index flips after Present (re/dlss.md 2.2).
   void* nt = g_auto_bb();
   ID3D12Resource* proxy = nt ? *reinterpret_cast<ID3D12Resource**>(static_cast<char*>(nt) + 0x88) : nullptr;
@@ -976,6 +978,11 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   perf();
   auto_step(t);
   limit(n_gen > 0);
+  // Reflex (reflex.cpp): the driver's sleep before the next frame starts, after our cap. Counted with
+  // the limiter's sleep as time the frame didn't work.
+  const int64_t r0 = now_us();
+  reflex_present_end(S.dev);
+  S.lim_sleep_us += now_us() - r0;
   return true;
 }
 
@@ -1104,6 +1111,8 @@ void fg_register() {
     else if (id == "fg.target_hz") S.target_hz = std::max(0.0, atof(v.c_str()));
     else if (id == "fg.fps_limit") S.fps_limit = std::max(0.0, atof(v.c_str()));
     else if (id == "fg.auto_cap") S.auto_cap = v != "0" && v != "false" && v != "off";
+    else if (id == "fg.reflex") reflex_config(v == "boost" ? 2 : v == "on" || v == "1" ? 1 : 0, cfg_bool("fg.reflex_markers", true));
+    else if (id == "fg.reflex_markers") reflex_config(cfg_str("fg.reflex") == "boost" ? 2 : cfg_str("fg.reflex") == "on" ? 1 : 0, v != "0" && v != "false" && v != "off");
     else if (id == "fg.auto_cap_lag") S.auto_cap_lag = std::max(0.2, std::min(2.0, atof(v.c_str())));
     else if (id == "fg.active") S.on = v != "0" && v != "false" && v != "off";
     else if (id == "fg.show")
@@ -1123,7 +1132,7 @@ void fg_register() {
       }
       return "{\"enabled\":" + std::string(S.enabled ? "true" : "false") + ",\"feature\":" +
              std::string(S.feature ? "true" : "false") + ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
-             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + "}";
+             ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() + "}";
     }
     if (sub == "latency") {
       std::string what = a.size() > 1 ? a[1] : "";

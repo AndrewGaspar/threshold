@@ -33,7 +33,7 @@ options = ["fg.enabled", "fg.count", "fg.active", "fg.hudless"]
 
 [[page.group]]
 title = "Automatic multiplier and pacing"
-options = ["fg.auto_cap", "fg.count_min", "fg.count_max", "fg.target_hz", "fg.fps_limit", "fg.pace", "fg.camera"]
+options = ["fg.auto_cap", "fg.reflex", "fg.count_min", "fg.count_max", "fg.target_hz", "fg.fps_limit", "fg.pace", "fg.camera"]
 
 [option."fg.enabled"]
 type = "bool"
@@ -110,8 +110,20 @@ apply = "live"
 [option."fg.auto_cap"]
 type = "bool"
 label = "Automatic frame-rate cap"
-help = "Caps the game's own frame rate with headroom for frame generation and at most the refresh rate divided by the multiplier, so the game never waits for generated frames. Off: uncapped unless a cap is set."
-default = true
+help = "Caps the game's own frame rate with headroom for frame generation and at most the refresh rate divided by the multiplier, so the game never waits for generated frames. Costs a little latency on a fast GPU (docs/fg.md). Off: uncapped unless a cap is set."
+default = false
+apply = "live"
+
+[option."fg.reflex"]
+type = "enum"
+label = "NVIDIA Reflex (injected)"
+help = "The game has no Reflex; this adds the driver's low-latency sleep before each frame (needs NVAPI under Proton)."
+values = [
+  { value = "off", label = "Off" },
+  { value = "on", label = "On" },
+  { value = "boost", label = "On + Boost" },
+]
+default = "off"
 apply = "live"
 
 [option."fg.hudless"]
