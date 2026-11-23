@@ -3,7 +3,8 @@
 > **This branch (wip/stereo-hdr-level-change)**: the HDR level-change hang is a GPU page fault
 > (Xid 13 MMU fault, rayblaster r9), not the async-queue race first suspected. Holding the async RT
 > paths off did not fix it; `rt_async_build` defaults to 1 again (the engine's settings, as on main).
-> Still open; see "Level-change hang".
+> A fallback (mono while the engine changes level, `load_mono`) passed 6/6 HDR teleports but a
+> checkpoint restart still faulted after pairs resumed (r15). Still open; see "Level-change hang".
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -490,6 +491,22 @@ duplicated into both halves (2D for the load) while any of these holds, plus a 2
 - `coregame::onIsLoading()` returns true.
 Dev `load_mono = 0` renders pairs through loads. `stereo status`: `level_changes`, `load_mono`
 (mono frames).
+
+**Fallback result (r15, HDR, `hdr_hud_wide = 1`).**
+- 6/6 teleports, with 1565-650 mono frames per jump (`load_mono` 5776 after six) and pairs resumed
+  each time. One `signaller_worker` timeout in game.log; Xid 13 at 01:51:47 belongs to the restart
+  below.
+- The HUD was in both eyes throughout: hud_wide equals pairs.
+- A **checkpoint restart then still faulted** (`Xid 13 MMU fault`, 01:51:47). It hit after pairs had
+  resumed (pairs 6050 → 6933), and no mono frames were rendered during the reload (no world renders
+  while its loading screen shows). So the hazard outlasts the engine's loading state: streaming
+  carries on after the load, and the 2 s tail is not enough.
+- Not safe for main yet. Options:
+  - a longer, activity-based window, e.g. mono until N seconds without new BLAS builds or texture
+    uploads, or simply 10-15 s after any level change;
+  - better, find the use-after-free. Next: the fence trace plus a vkd3d breadcrumb/debug build
+    (`VKD3D_CONFIG=breadcrumbs`) to name the faulting command list, or bisect the pair-only pieces
+    (vis reuse, SSAO prepare, video skip) by forcing each one's mono behaviour.
 
 **Superseded: under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
 off (`rt_async_hold`; dev `rt_async_build = 1` keeps the engine's setting). The build then runs on
