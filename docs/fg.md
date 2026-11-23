@@ -370,6 +370,9 @@ Still no effect (sleep 0.3 ms per frame). The likely reason, besides the fast GP
 present", default on; static, re/dlss.md 2.3), so there is no render queue for Reflex to drain. Reflex
 therefore stays **off by default**; it is there for slower GPUs, where it is still to be measured.
 
+Latency with stereo 3D (FG off / 2x / 4x, same method, same session as mono): docs/stereo.md,
+"Stereo with frame generation" (r49).
+
 ### 10. Stereo (side-by-side 3D, `[stereo] mode = sbs`)
 
 With stereo's packed output (`full`/`sbs`: a 2W swapchain) the frame FG gets is both eyes side by

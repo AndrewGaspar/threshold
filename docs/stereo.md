@@ -3,7 +3,7 @@
 > **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r45, RT reflections):
 > the right eye's acceleration-structure job now runs the BLAS builds that only it has
 > (`as_once = 5`), and the frame is mono during level changes until streaming settles
-> (`load_mono = 1`, ~30-40 s after a teleport). See "Level-change hang". All
+> (`load_mono = 1`: the loading screen plus ~3 s, up to 25 s or more in busy areas). See "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
 > both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
 > per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
@@ -400,6 +400,38 @@ R(n−1) to R(n).
 | r4 c0sh | **negative control**: one feature for both eyes (`[fg] stereo_features = 1`) | 0.494 / **0.959**, 0.510 / **0.966** | **23.19** / 12.17, **22.93** / 12.34 px | **17.6, 18.5 px** | 0.37, 0.40 px |
 | r5 p2x | 2x, projection convergence (the default with FG) | 0.502 / 0.505, 0.510 / 0.504 | −14.40 / −14.40, −15.08 / −14.66 px | 0.41, 0.49 px | 0.46, 0.54 px |
 | r5 p4xb | 4x, projection | 0.251 / 0.251, 0.500 / 0.501, 0.750 / 0.751 | −11.93 / −12.00 ... | 0.27-0.52 px | 0.65 px |
+| r48 rt4x | 4x, projection, **all RT effects on**, display 1920x1080 (`control-stereo`) | 0.237 / 0.238, 0.475 / 0.476, 0.713 / 0.713 | −15.2 / −11.7, −14.9 / −11.9, −14.8 / −12.8 px | 0.82, 0.65, 0.42 px | 0.81 px |
+
+r48 (`tools/fg/stereo-grab control-stereo OUT rt4x 2 2`, one job captured while turning): both eyes
+sit at the same fraction of the step, the generated frames' disparity moves no more than the real
+frames' own does between them, and each generated eye is nearer its own eye's real frame than the
+other eye's (err same / other eye: 3.9 / 5.4, 3.3 / 4.9, 2.6 / 4.7 left; 3.9 / 5.8, 3.4 / 5.3,
+2.7 / 4.8 right). The ratios sit ~5 % under k/m in both eyes alike (the turn was faster here than in
+r5, at a lower rendered rate).
+
+**Latency in 3D (rayblaster r49, under `quiver lab gpu`).** `tools/fg/latency` (docs/fg.md 8: 40
+mouse-look injections, the first frame whose camera turned, ms after the input, median (p10–p90)),
+run from a private copy of `tools/` on rayblaster (`~/threshold-lab-stereo`, `lat-series`: live
+`quiver lab set` between cases, each case under the GPU lock, two rounds a/b). Instance
+`control-stereo` (display 1920x1080@60, `output = full`), renderer.ini DLSS Quality, **RT off** (as in
+fg.md 8), lobby, 32.5 mm. FG off = `[fg] active = 0` (same proxy path). Mono = `[stereo] mode = off`
+in the same session (still the packed output: the one image copied into both halves). "fps" counts
+DLSS evaluations, so in 3D it is two per displayed frame (pairs/s = half).
+
+| case | evals/s | eval recorded | frame done (GPU) | first present | real present |
+|---|---|---|---|---|---|
+| 3D, FG off (a / b) | 147.3 / 146.3 | 15.0 / 14.8 | 19.5 / 19.1 | **17.8 / 17.4** (14.5–22.7) | 17.8 / 17.4 |
+| 3D, 2x | 139.0 / 138.4 | 16.0 / 16.8 | 20.5 / 21.5 | **22.5 / 23.6** (19.6–27.1) | 26.1 / 27.1 |
+| 3D, 4x | 128.7 / 128.8 | 18.2 / 17.6 | 24.8 / 24.1 | **28.2 / 27.5** (24.1–30.6) | 33.9 / 33.4 |
+| mono, FG off | 208.1 / 209.3 | 12.1 / 11.8 | 14.1 / 13.6 | **12.9 / 12.3** (10.3–16.5) | 12.9 / 12.3 |
+| mono, 4x | 176.7 / 177.5 | 14.0 / 14.0 | 16.3 / 16.5 | **19.7 / 20.2** (16.8–22.4) | 24.0 / 24.6 |
+
+- 3D costs ~5 ms to the first present without FG (17.6 vs 12.6 ms): a pair takes two world renders
+  (~73 pairs/s against ~209 mono frames/s), and the input lands in the left eye's render.
+- FG adds the same kind of cost as in mono, scaled by the slower frame: +5.5 ms (2x) and +10 ms (4x)
+  to the first present in 3D, against +7.3 ms (4x) in mono here; the real frame +9 / +16 ms.
+- The same-session mono numbers are ~1 ms (off) to ~4 ms (4x) above fg.md 8's r7–r8 (11.9 / 16.2):
+  another instance and display (60 Hz, the packed 2W output), not the same build's setting.
 
 - **Each eye's generated frames are that eye's.** Both eyes interpolate at k/m, and the disparity of
   generated frames equals the real frames' to within the real frames' own frame-to-frame change.
@@ -507,12 +539,21 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 
 ## Open issues
 
-- **Stereo + FG** (works, measured above, including 20 level changes): not tested with RT on (the RT
-  fault below comes first) or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
+- **Stereo + FG** (works, measured above, including 20 level changes, and with all RT effects on,
+  r48): not tested on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
   rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
+- **2D after a level change.** Measured from the logs (r45, r47: `nav: lab state` and `stereo: level
+  change settled`): the loading screen itself is ~6-9 s (no world renders then anyway); after it,
+  3D resumes ~3 s later in some places (mail-room, motel, entry-lobby), but in others (cafeteria,
+  dead-letters) the BLAS-build bursts go on for more than the soak's ~25 s dwell, which is where the
+  "30-40 s" came from (those settles span two teleports). Hypothesis, not tested (shortening the
+  window risks the level-change hang): the burst threshold (2x the lobby's average + 8 builds per
+  job) is relative to the lobby, so a busier area's steady streaming reads as a burst. Next: log the
+  per-job build counts through a tail (no risk: `load_mono` stays on) to tell a decaying load burst
+  from that area's steady rate, then make the threshold follow the new area's rate.
 - **Why the right eye's new BLAS builds hang during a level change** (Xid 109, r41/r42) is not
-  known; `load_mono` keeps those frames mono instead (2D for ~30-40 s after each teleport). Suspect:
+  known; `load_mono` keeps those frames mono instead (2D through the load and ~3-25+ s after it). Suspect:
   BLAS storage is allocated on worker jobs ("rtd:Threaded resource allocation", static
   renderer+0x151570 `RaytracingStaticMeshStorage`) and an entry that enters the lists between the
   eyes may be built before its allocation has finished. `mode = left` faulted once in r33 (one
@@ -589,7 +630,7 @@ entries (pointers). The right eye's job skips those and runs the build entries t
 again next update. Running the right eye's new builds hangs during a level change (r41 with bit 8,
 r42 without: `Xid 109` within seconds of the first teleport, after 14 and 10 min without a fault in
 the world), so the frame stays mono while the engine changes level and until BLAS-build bursts settle
-(`load_mono`, ~30-40 s after a teleport, r43).
+(`load_mono`: ~3 s after the loading screen in some areas, 25+ s in busier ones; r43, r45, r47).
 
 | run | settings (sbs, RT reflections only) | result |
 |---|---|---|
@@ -598,6 +639,8 @@ the world), so the frame stays mono while the engine changes level and until BLA
 | r42 | `as_once = 5` (builds only) | **10 min in the world, no fault** (5480 new builds run); first teleport: `Xid 109` |
 | r43 | `as_once = 5`, `load_mono = 1` | **22 teleports in 610 s, no Xid, no `signaller_worker` timeout** |
 | r45 | the shipped defaults (main 0a5eb41 merged in, `as_once = 5`, `load_mono = 1`) | **10 min in the world, then 9 teleports in 256 s: no Xid, no `signaller_worker` timeout** (7 level changes settled back to 3D) |
+| r47 | shipped defaults, **all RT effects on** (renderer.ini: reflections 2, transparent 2, indirect diffuse 2, contact shadows 2, debris 1; the user's preset) | **10 min in the world, then 11 teleports in 309 s: no Xid, no `signaller_worker` timeout** |
+| r48 | as r47 with `[fg] enabled = 1`, `count = 4` | **5 min in the world, then 5 teleports: no Xid, no `signaller_worker` timeout**, FG `fail 0`, 105 rendered + 315 generated presents/s in the lobby; per-eye check below |
 
 Leads checked and ruled out: the eye's `m::View` copy is not kept past `renderWorld` (static:
 renderer+0x11daf0 copies it into the renderer's own `rend::View` at +0x678 and clears its only
