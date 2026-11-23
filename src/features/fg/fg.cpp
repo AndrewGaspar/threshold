@@ -28,6 +28,7 @@
 #include "core/present.h"
 #include "features/fg/common.h"
 #include "features/fg/engine.h"
+#include "features/fg/hdr.h"
 #include "features/fg/trace.h"
 
 namespace th::fg {
@@ -163,6 +164,9 @@ struct Inputs {
 
 struct Set {
   Tex real, depth, mv, out[kMaxGen];
+  // HDR (FP16 scRGB swapchain): DLSS-G works on HDR10 PQ copies (hdr.cpp). enc / hud_enc: the real
+  // frame and the HUD-less colour encoded; dec: the generated frames decoded back to scRGB (presented).
+  Tex enc, hud_enc, dec[kMaxGen];
   D3D12_RESOURCE_DESC depth_desc{}, mv_desc{};
   Inputs in;
 };
@@ -192,6 +196,7 @@ struct State {
   double cap_now = 0;
   // count = auto controller windows
   int64_t aw_start = 0, aw_work = 0;
+  std::atomic<int64_t> aw_lag_sum{0}, aw_lag_n{0};  // DLSS-G done after the game's Present (window)
   unsigned aw_frames = 0;
   int up_streak = 0, down_streak = 0;
   int64_t last_up_us = 0, last_down_us = 0, down_block_until = 0, down_block_s = 10;
@@ -221,6 +226,8 @@ struct State {
   void* eparams = nullptr;
   unsigned caps_max_gen = 1;
   unsigned feat_w = 0, feat_h = 0, feat_rw = 0, feat_rh = 0, feat_gen = 0;
+  DXGI_FORMAT feat_fmt = DXGI_FORMAT_UNKNOWN;
+  bool hdr = false;  // the swapchain is FP16 scRGB: DLSS-G runs on HDR10 PQ copies
   bool reset = true;
   uint64_t bb_id = 0;
 
@@ -329,9 +336,14 @@ bool ensure_ngx() {
   return S.ngx_ok;
 }
 
+// The format DLSS-G sees: the swapchain's, or HDR10 (R10G10B10A2 PQ) for an scRGB swapchain.
+DXGI_FORMAT ngx_fmt() { return S.hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : S.fmt; }
+
 bool ensure_feature(unsigned rw, unsigned rh) {
   unsigned gen = S.caps_max_gen;  // created for the largest count; evaluations may use fewer
-  if (S.feature && S.feat_w == S.w && S.feat_h == S.h && S.feat_rw == rw && S.feat_rh == rh && S.feat_gen == gen) return true;
+  if (S.feature && S.feat_w == S.w && S.feat_h == S.h && S.feat_rw == rw && S.feat_rh == rh && S.feat_gen == gen &&
+      S.feat_fmt == ngx_fmt())
+    return true;
   if (S.feature) {
     S.rring.wait(S.rring.next);
     N.Release(S.feature);
@@ -344,7 +356,7 @@ bool ensure_feature(unsigned rw, unsigned rh) {
   N.SetUI(p, NVSDK_NGX_Parameter_Height, S.h);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Width, S.w);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Height, S.h);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, unsigned(S.fmt));
+  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, unsigned(ngx_fmt()));
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, gen);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InternalWidth, rw);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InternalHeight, rh);
@@ -354,12 +366,12 @@ bool ensure_feature(unsigned rw, unsigned rh) {
   uint32_t r = N.Create(cl, NVSDK_NGX_Feature_FrameGeneration, p, &S.feature);
   S.rring.wait(S.rring.submit(S.q));
   TH_LOG("fg: CreateFeature(FrameGeneration %ux%u, render %ux%u, format %d, count %u) = 0x%08x (%.0f ms)", S.w, S.h, rw,
-         rh, int(S.fmt), gen, r, (now_us() - t0) / 1000.0);
+         rh, int(ngx_fmt()), gen, r, (now_us() - t0) / 1000.0);
   if (ngx_failed(r) || !S.feature) {
     S.feature = nullptr;
     return false;
   }
-  S.feat_w = S.w, S.feat_h = S.h, S.feat_rw = rw, S.feat_rh = rh, S.feat_gen = gen;
+  S.feat_w = S.w, S.feat_h = S.h, S.feat_rw = rw, S.feat_rh = rh, S.feat_gen = gen, S.feat_fmt = ngx_fmt();
   S.reset = true;
   return true;
 }
@@ -378,6 +390,17 @@ bool ensure_outputs(Set& st, unsigned n) {
     if (!make_tex(S.dev, st.real, d, D3D12_RESOURCE_STATE_COPY_DEST, L"threshold fg real")) return false;
   }
   d.Flags = D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
+  if (S.hdr) {
+    // scRGB decoded generated frames (presented), then the HDR10 textures DLSS-G works on.
+    for (unsigned i = 0; i < n; ++i)
+      if (!st.dec[i].r && !make_tex(S.dev, st.dec[i], d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"threshold fg generated scRGB"))
+        return false;
+    d.Format = ngx_fmt();
+    if (n && !st.enc.r && !make_tex(S.dev, st.enc, d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"threshold fg real PQ")) return false;
+    if (n && !st.hud_enc.r && !make_tex(S.dev, st.hud_enc, d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"threshold fg HUD-less PQ"))
+      return false;
+  }
+  d.Format = ngx_fmt();
   for (unsigned i = 0; i < n; ++i)
     if (!st.out[i].r && !make_tex(S.dev, st.out[i], d, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, L"threshold fg generated"))
       return false;
@@ -402,14 +425,27 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
   to(cl, st.mv, kSrv);
   void* p = S.eparams;
   const Inputs& in = st.in;
-  N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Backbuffer, st.real.r);
+  const unsigned slot0 = unsigned(&st - S.sets) * 8;  // hdr.cpp descriptor slots of this set
+  if (S.hdr) {  // scRGB -> HDR10 PQ for DLSS-G
+    to(cl, st.enc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    hdr_convert(cl, st.real.r, st.enc.r, true, slot0);
+    to(cl, st.enc, kSrv);
+  }
+  N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Backbuffer, S.hdr ? st.enc.r : st.real.r);
   N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Depth, st.depth.r);
   N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_MVecs, st.mv.r);
   // HUD-less colour (engine.cpp): the colour target before the UI, in the engine's tracked state.
   if (hud) {
     barrier(cl, hud->r, hud->st, kSrv);
     D3D12_RESOURCE_DESC hd = hud->r->GetDesc();
-    N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hud->r);
+    ID3D12Resource* hl = hud->r;
+    if (S.hdr) {  // the HUD-less colour is scRGB too (checked at the take): encoded like the real frame
+      to(cl, st.hud_enc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      hdr_convert(cl, hud->r, st.hud_enc.r, true, slot0 + 1);
+      to(cl, st.hud_enc, kSrv);
+      hl = st.hud_enc.r;
+    }
+    N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hl);
     N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseX, 0);
     N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseY, 0);
     N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, std::min<unsigned>(unsigned(hd.Width), S.w));
@@ -462,7 +498,7 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
   N.SetF(p, NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, in.jy);
   N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue, 1.17549435e-38f);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, unsigned(++S.bb_id));
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, 0);
+  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, S.hdr ? 1 : 0);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthInverted, 0);  // conventional Z (re/dlss.md 3)
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Reset, (S.reset || in.reset || (use_cam && !cam.has_prev)) ? 1 : 0);
@@ -494,6 +530,14 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
     made = i;
   }
   S.reset = false;
+  if (S.hdr) {  // HDR10 PQ -> scRGB, what is presented
+    for (unsigned i = 0; i < made; ++i) {
+      to(cl, st.out[i], kSrv);
+      to(cl, st.dec[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+      hdr_convert(cl, st.out[i].r, st.dec[i].r, false, slot0 + 2 + i);
+      to(cl, st.dec[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+    }
+  }
   for (unsigned i = 0; i < made; ++i) to(cl, st.out[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
   if (hud) {
     // [fg] show = hudless: the HUD-less copy presented in place of the real frame (same format only).
@@ -593,6 +637,8 @@ void present_thread() {
         const int64_t t_ready = now_us();
         S.lag_sum += t_ready - j.arrive_us;
         S.lag_n++;
+        S.aw_lag_sum += t_ready - j.arrive_us;
+        S.aw_lag_n++;
         for (unsigned i = 0; i < j.n_gen; ++i) {
           int64_t target = 0;
           if (i == 0) {
@@ -603,7 +649,7 @@ void present_thread() {
           }
           int64_t now = now_us();
           if (target > now && target - now < 2 * step) sleep_until(target);
-          present_tex(st.out[i].r, j, 'G', int(i) + 1, int(m), step);
+          present_tex(S.hdr ? st.dec[i].r : st.out[i].r, j, 'G', int(i) + 1, int(m), step);
           prev_call = S.last_call_us;
           prev_ret = S.last_present_us;
           ++shown_gen;
@@ -722,7 +768,8 @@ void limit(bool fg_frame) {
 // time (arrival interval minus the limiter's sleep and waits for the present thread), in
 // [count_min, count_max]: one step up when the game can't hold target / multiplier (10 % short, 2 s);
 // one step down when it could hold target / (multiplier - 1) with 15 % to spare (3 s). A step down
-// undone within 6 s blocks further steps down for 10 s, doubling up to 60 s. Windows with a hitch
+// undone within 30 s blocks further steps down for 10 s, doubling up to 60 s (Pharos: 6 s; the
+// renderer-side work time overestimates a capped game, see docs/fg.md). Windows with a hitch
 // (below 60 % of the cap) change nothing.
 void auto_step(int64_t now) {
   if (!S.aw_start) S.aw_start = now;
@@ -733,6 +780,8 @@ void auto_step(int64_t now) {
   const double real_fps = frames / secs;
   S.aw_start = now;
   S.aw_work = 0;
+  const int64_t lag_n = S.aw_lag_n.exchange(0), lag_sum = S.aw_lag_sum.exchange(0);
+  const double lag_us = lag_n ? double(lag_sum) / lag_n : 0;
   S.aw_frames = 0;
   if (!S.count_auto) {
     S.auto_count = std::max(2u, std::min(S.count.load(), S.caps_max_gen + 1));
@@ -747,12 +796,19 @@ void auto_step(int64_t now) {
     return;
   }
   const double target = target_now();
-  S.up_streak = m < hi && work_fps < 0.9 * target / m ? S.up_streak + 1 : 0;
-  S.down_streak = m > lo && work_fps > 1.15 * target / (m - 1) ? S.down_streak + 1 : 0;
+  // What the game can deliver: its own work rate, no more than a manual cap ([fg] fps_limit 40 with a
+  // 165 Hz target means 4x).
+  const double lim = S.fps_limit.load();
+  const double can = lim > 0 ? std::min(work_fps, lim) : work_fps;
+  // The renderer thread's work time misses the GPU once frames are capped with headroom, so a step down
+  // also needs DLSS-G to finish early enough for the shorter interval (Pharos: lag below 0.55 of it).
+  const double lag_ok = lag_us < 0.55 * 1e6 * (m - 1) / target;
+  S.up_streak = m < hi && can < 0.9 * target / m ? S.up_streak + 1 : 0;
+  S.down_streak = m > lo && can > 1.15 * target / (m - 1) && lag_ok ? S.down_streak + 1 : 0;
   unsigned was = m;
   if (S.up_streak >= 2) {
     m++;
-    if (S.last_down_us && now - S.last_down_us < 6000000) {  // a step down undone: hold off
+    if (S.last_down_us && now - S.last_down_us < 30000000) {  // a step down undone: hold off
       S.down_block_until = now + S.down_block_s * 1000000;
       S.down_block_s = std::min<int64_t>(S.down_block_s * 2, 60);
     }
@@ -763,8 +819,8 @@ void auto_step(int64_t now) {
   }
   if (m != was) {
     S.up_streak = S.down_streak = 0;
-    TH_LOG("fg: count auto %ux -> %ux (work %.1f fps, real %.1f fps, target %.0f presents/s, cap %.1f)", was, m, work_fps,
-           real_fps, target, target / m);
+    TH_LOG("fg: count auto %ux -> %ux (work %.1f fps, real %.1f fps, DLSS-G done %.1f ms after Present, target %.0f "
+           "presents/s, cap %.1f)", was, m, work_fps, real_fps, lag_us / 1000.0, target, lim > 0 ? std::min(lim, target / m) : target / m);
   }
   S.auto_count = m;
 }
@@ -823,7 +879,13 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   unsigned n_gen = 0;
   if (want && !st.in.ok) ++S.p_noinput;
   EngTex hud;
-  const bool have_hud = hudless_take(hud) && hud.tracked && S.hudless.load();
+  bool have_hud = hudless_take(hud) && hud.tracked && S.hudless.load();
+  // In HDR the HUD-less colour must be scRGB like the swapchain to be encoded like the real frame.
+  if (have_hud && S.hdr && hud.r->GetDesc().Format != S.fmt) {
+    static int n = 0;
+    if (n++ < 1) TH_LOG("fg: HDR: HUD-less colour is DXGI %d, not the swapchain's %d: not used", int(hud.r->GetDesc().Format), int(S.fmt));
+    have_hud = false;
+  }
   if (want && st.in.ok && ensure_ngx() && ensure_feature(st.in.rw, st.in.rh) && ensure_outputs(st, want)) {
     n_gen = evaluate(st, proxy, want, have_hud ? &hud : nullptr);
     if (n_gen < want) ++S.p_fail;
@@ -885,13 +947,19 @@ bool getbuffer(IDXGISwapChain* sc, unsigned i, REFIID riid, void** out, long* hr
   }
   DXGI_SWAP_CHAIN_DESC d{};
   sc->GetDesc(&d);
-  if (d.BufferDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT) {
+  // HDR: the game's FP16 swapchain is scRGB (linear BT.709; docs/stereo.md "HDR"). DLSS-G gets HDR10 PQ
+  // copies (hdr.cpp).
+  const bool hdr = d.BufferDesc.Format == DXGI_FORMAT_R16G16B16A16_FLOAT;
+  if (hdr && !hdr_init(S.dev)) {
     static bool said = false;
-    if (!said) TH_LOG("fg: HDR (FP16 scRGB) swapchain: not supported yet, frame generation off");
+    if (!said) TH_LOG("fg: HDR (FP16 scRGB) swapchain without the PQ conversion: frame generation off");
     said = true;
     S.enabled = false;
     return false;
   }
+  if (hdr != S.hdr) TH_LOG("fg: swapchain %s: DLSS-G input %s", hdr ? "FP16 scRGB (HDR)" : "SDR",
+                           hdr ? "HDR10 PQ (converted)" : "as presented");
+  S.hdr = hdr;
   if (!S.proxy[i].r || S.w != d.BufferDesc.Width || S.h != d.BufferDesc.Height || S.fmt != d.BufferDesc.Format) {
     ID3D12Resource* real = nullptr;
     if (FAILED(present_real_buffer(sc, i, __uuidof(ID3D12Resource), (void**)&real))) return false;
@@ -917,7 +985,10 @@ void before_resize(IDXGISwapChain* sc) {
   for (Tex& p : S.proxy) safe_release(p.r);
   for (Set& st : S.sets) {
     safe_release(st.real.r);
+    safe_release(st.enc.r);
+    safe_release(st.hud_enc.r);
     for (Tex& o : st.out) safe_release(o.r);
+    for (Tex& o : st.dec) safe_release(o.r);
     st.in.ok = false;
   }
   S.reset = true;
