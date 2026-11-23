@@ -6,7 +6,9 @@
 > acceleration structures" and, for the history, "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
 > both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
-> per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
+> per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation". World-anchored HUD
+> markers sit at the depth of what they mark and the pause menu keeps a 3D background (branch
+> `wip/stereo-ui-depth`, measured on rayblaster `control-ui`): "The UI layer".
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -47,6 +49,8 @@ left, right eye right, the HUD hint in both halves.*
 | Frame generation at the same time (2x-4x, per eye: two DLSS-G features, per-eye inputs, HUD-less from the side-by-side texture) | done | measured, rayblaster r4-r5, "Stereo with frame generation" |
 | Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once = 5`: the right eye skips the left eye's BLAS builds/compactions and runs its own new builds; `load_mono`: mono until streaming settles) | live, rayblaster r18/r19 (RT on, old as_once), r43 (22 teleports, RT reflections), "Level-change hang" |
 | Ordinary play with RT on in sbs (the in-world GPU fault) | fixed (`as_once = 5`) | live, rayblaster r41/r42 (14 and 10 min in the world, every earlier 3D run faulted within ~3 min) |
+| World-anchored HUD markers (interaction / collectible prompts, mission markers) at the depth of what they mark, or just in front of the surface hiding it (`ui_markers`) | done | measured, rayblaster `control-ui` r6, r12, r13, "The UI layer" |
+| Pause menu over a per-eye background, the menu at the screen plane (`ui_pause`) | done (`full`/`sbs`; `hsbs` too, from the side-by-side texture) | measured, rayblaster `control-ui` r12 (and r13 with 2x FG), "The UI layer" |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
 mono 81.4 / 61.2 presents/s, sbs 40.9 / 30.9 (two rounds; the ratio is 0.50 both times).
@@ -331,6 +335,103 @@ scRGB; the side-by-side texture follows the colour target's format (engine forma
 - Per-eye output: captures are linear FP16; `stereo_sbs.py raw` decodes them (also R11G11B10 and
   R10G10B10A2), and BMP captures of FP16 are now clamped and gamma-encoded instead of garbled.
 
+### The UI layer: world markers and the pause background (`ui.cpp`)
+
+The user's report on a HypXRland XReal display (2026-11-23): world markers (collectible hints,
+objective markers) sat at the screen plane with the rest of the HUD, and the pause menu's frozen
+background was the same flat image in both eyes. Both are fixed on `wip/stereo-ui-depth`; the
+approach follows Pharos (`~/code/ac-dlss/docs/STEREO.md`, "Predator Bow and tracked markers"): the
+game's own world positions for the markers, a depth probe along the camera ray for obstruction,
+and a per-eye shift of the marker's sprites.
+
+**How the HUD is drawn (static: ui_rmdwin10_f.dll in Ghidra; live: `stereo ui dump N`).** The HUD
+and menus are Coherent GT. renoir records each view's paint; `ui::UIRendererBackend` (ui dll,
+vtable slot 24 `ExecuteRendering`, ui+0x32080) executes it on the renderer thread inside
+`renderHUD`, where gpu.cpp already repeats every draw in the right half. Per draw the backend sets
+the vertex constant "Transform" (ui+0x2c1a0, type 0, a row-major float4x4) and binds textures
+(ui+0x2cd40, `txBuffer0..3`); render targets go through the d3d export `setRenderTargets`. Coherent
+paints each animated element into its own small layer texture (64x64, 64x128, 320x128, ...) and
+composites it into the colour target with one textured quad whose Transform translation is the
+element's position: live, x = T[3] x viewport width, y = T[7] x viewport height, within ~5 px of the
+anchor's projected position (r5: 15 frames while turning, T[3] tracked the projection at 1/3840 per
+px in the 3840-wide side-by-side viewport). Static parts are cached in one 1920x1088 layer.
+
+**World markers.** The HUD projects every world-anchored widget with one function,
+`Control_DX12.exe+0x5edb50` (static: called by the mission marker update exe+0x621410, the
+interaction marker update exe+0x605180 and other widgets): it takes the anchor and an offset, projects
+with the game camera (16:9), clamps an off-screen point to the safe-area edge and returns the UI
+pixel position. A hook keeps the world point and the result of each call (ring of 128, game
+thread). Per side-by-side HUD pass (renderer thread):
+- each anchor projected in the last 3 frames becomes a marker; its depth is the anchor's distance
+  along the centre camera's forward axis (the pair's `m::View`);
+- the first surface on the ray: one texel of the left eye's linear depth (the render graph's
+  persisted `lineardepthcopy`, R16_FLOAT, metres: live, the checkpoint marker's ray read 23.3 m on
+  the wall behind its 18.2 m anchor) at the anchor's position in the left eye's image, copied on the
+  engine's list at the HUD's first draw into a readback ring, read 3 passes later;
+- the marker's depth z is the anchor's, or 0.97 x the surface's when the surface is nearer (an
+  obstructed marker sits just in front of the occluder); edge-clamped markers use the surface at the
+  clamped point; the per-eye shift is the scene's disparity at z, `±e·m00·W/2/z` plus the eye's
+  convergence image shift (or minus `e·m00·W/2/Zc` with projection convergence);
+- a draw composited into the 2W target whose texture is at most 256x256 and whose Transform position
+  is within 56 px (x) / 80 px (y) of a marker gets that marker's shift: gpu.cpp issues the left and
+  the right draw with their viewports moved by the eye's shift (fractional) and the scissor kept in
+  the eye's half.
+
+Measured (rayblaster `control-ui`, display 3840x1080, `output = full`, 1920x1080 per eye, DLAA,
+RT on, 32.5 mm, convergence 4 m; `re/scripts/stereo_marker.py` on screenshots: the marker's bright
+pixels' centroid in each half vs patch matches of the scene around it; disparity = x_left - x_right):
+
+| case | marker | disparity of the marker | scene next to it |
+|---|---|---|---|
+| r6, lobby, checkpoint interaction marker, visible (anchor 18.2 m, surface behind 23.3 m) | at the anchor | **-18.64 px** (expected -18.62) | the red lamp beside it -18.64, -18.56 px; the desk below -17.85 px |
+| r12, the same marker over its sign (anchor 17.0 m, the sign's surface 15.2 m) | obstructed: 0.97 x 15.2 = 14.7 m | **-17.21 px** (expected -17.34) | the sign -17.84, -18.04 px (the marker is just in front) |
+| r13, `[fg] count = 2` (projection convergence), the visible marker | at the anchor (18.2 m) | **-19.08 px** (expected -19.10) | the lamp -19.06, -19.06 px |
+| before (main) | screen plane | 0 px (identical in both halves) | |
+
+Off-screen interaction markers are not drawn by the game (r12: the projection clamps, no edge arrow
+appears). No mission marker was on screen at the `game-start` story point, so mission markers and
+edge arrows were not seen live; they go through the same projection and composite path (static).
+
+**Pause background.** `renderHUD`'s pause frames (no world render) draw the menu over a frozen
+frame. That frame is RendererX86 slot 22 (renderer+0x135840, static): it copies the back buffer at
+(viewport offset, the texture's size) into a game-owned texture, once, on the frame the menu opens
+(live r5: the only full-frame copy, from renderer+0x135901); every paused frame the engine's
+ShapeEngine then draws that texture full screen (one 6-index draw outside the UI backend; live r6:
+swapping the texture's content around that draw's right-half copy changes the right half's
+background), and the Coherent menu composites over it. With the 2W back buffer the copy took the left eye only, and the
+mono duplicate showed it in both eyes.
+- Slot 22 hooked: after the engine's copy, the right eye (the back buffer's [W, 2W)) goes into a
+  texture of ours, and the left one is saved too.
+- Paused frames (no pair, a capture of this pause active) run `renderHUD` over the side-by-side
+  texture with the draw duplication armed, like a pair; for the background draw's right-half copy,
+  the right eye's capture is copied into the game's texture first and the left one copied back after
+  (on the engine's list, around that one draw). The menu is drawn twice at the same position: the
+  screen plane. `end` blits it like a pair.
+- `renderHUD` must leave +0x3c8 pointing at the side-by-side texture for `end` (r6-r11 restored it
+  to null as the pair path does for its own texture; `end` then blitted nothing and the stale back
+  buffer showed: no menu). Also, in the pause path only, the 2W pool depth-stencil
+  ("pHudDepthStencil") is cleared to the engine's values (depth 1, stencil 0) when renderHUD
+  allocates it, as renderHUD does for a colour target it creates (`hud_ds_clear`); added while
+  bisecting r11, not shown to be needed on its own.
+- Ends at the next pair, at a load (quit to menu), or if the game's texture changes.
+- `output = hsbs`: the W-wide back buffer holds both eyes squeezed, so the engine's own copy was the
+  squeezed pair in each eye (r14: a double image under the menu, on main too). Both eyes are taken
+  from the side-by-side texture instead (the frame before `end`'s gamma blit): measured r15, the
+  pause dims the wall to 0.599 of the world's brightness against 0.600 with `full` (r12), so the blit
+  is an identity here (SDR, default brightness; HDR not tested); disparity -7.89 vs -7.70 squeezed
+  px in the world (engine at 3840 per eye on that display).
+
+Measured (r12, lobby, the same capture conditions; `stereo_disparity.py` per half):
+
+| capture | background (x 500-1880): median, p5..p95 | wall: median | menu "Resume Game" button: best shift, \|L-R\| at 0 |
+|---|---|---|---|
+| in the world before pausing | -16.11 px, -23.9..+20.0 | -18.12 px | (no menu) |
+| paused, `ui_pause = 1` | **-16.39 px**, -19.9..+19.5 | **-18.14 px** | **0 px, 0.00/255** |
+| paused, `ui_pause = 0` (main's behaviour) | -0.00 px | 0.00 px | 0 px, 0.00/255 |
+| r13, 2x FG: in the world / paused | | -18.68 / **-18.69 px** | menu in both halves (screenshot) |
+
+The menu is identical in both halves; the background keeps the world's disparity field.
+
 ## Stereo with frame generation
 
 Both run at once: `[fg] enabled = 1` with `mode = sbs` and a packed output. Approach 2 of the former
@@ -529,6 +630,8 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | dev: `load_mono` | 1 (inert with `as_once` 16) | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
+| `ui_markers` | 1 | world-anchored HUD markers at their depth (or in front of what hides them); 0 = screen plane. Live |
+| `ui_pause` | 1 | the pause menu's background per eye. Live (from the next pause) |
 | `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
 | dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection; with frame generation always the projection); synthetic yaw °/update |
 
@@ -892,6 +995,26 @@ waits never satisfied as `STUCK`.
 - **Next.** RT on once the RT fault is fixed; latency (`tools/fg/latency`) in 3D. Level changes:
   `re/scripts/stereo_rb_fg_levels.sh OUT` on a running `control-sfg` (passed, r10).
 
+### Resume notes: the UI layer (2026-11-23, branch `wip/stereo-ui-depth`)
+
+- **State.** World markers at depth and the per-eye pause background work and are measured ("The UI
+  layer"), with and without 2x FG. Code: `src/features/stereo/ui.cpp` (hooks, markers, pause),
+  gpu.cpp (per-draw callback: per-eye viewport shift with the scissor kept in its half, copies on the
+  engine's list mid-pass, texel probes), stereo.cpp (pause path in `renderHUD`, `UiFrame` per pair).
+- **Lab.** rayblaster instance `control-ui` (display 3840x1080@60 so `output = full` shows both eyes
+  1:1; GE-Proton11-12; renderer.ini copied from `control-stereo`: DLAA, all RT on). The `game-start`
+  lobby has one interaction marker: from `tools/lab/continue control-ui --mod DIR`, turn right
+  `quiver lab mouse control-ui 330 0 --steps 10`: the checkpoint's marker at ~(950, 450), 18 m.
+  `quiver lab call control-ui stereo ui status` (markers with anchor / surface / chosen depth and
+  shifts), `stereo ui dump N` (every UI draw: Transform, texture, render target, chosen shift).
+  `re/scripts/stereo_marker.py SHOT --box x0,y0,x1,y1 --ref ...` measures a marker against the scene.
+- **Open.** Mission markers and edge arrows were not seen live (none at this story point); the
+  match radius (56/80 px) and the 256x256 layer limit come from the one interaction marker seen. A
+  HUD widget composited within that radius of a marker (the reticle when aiming at a marker) would
+  move with it. HDR not tested with either. The
+  surface probe is 3 HUD passes old (a fast turn can use a stale surface for a few frames).
+  HypXRland not tested (the user's display).
+
 ## Reproducing
 
 ```sh
@@ -923,4 +1046,4 @@ The 3840x1080 display tests used `quiver lab create gog:2049187585 --name contro
 --display 3840x1080@60 --exe Control_DX12.exe` (renderer.ini `m_eWindowMode` 0 windowed, 1
 borderless, 2 exclusive; output 1920x1080).
 
-Lab verbs: `stereo status | hyprland | census N | shots N TAG [SKIP] | files | probe N | graph | grab KIND I [TAG] | fences N`.
+Lab verbs: `stereo status | hyprland | census N | shots N TAG [SKIP] | files | probe N | graph | grab KIND I [TAG] | fences N | ui [status|dump N]`.

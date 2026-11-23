@@ -255,7 +255,7 @@ apply = "live"
 [option."stereo.ui_pause"]
 type = "bool"
 label = "3D pause background"
-help = "The pause menu keeps a 3D background (each eye its own image); off, both eyes show the left eye's. Full side-by-side output only."
+help = "The pause menu keeps a 3D background (each eye its own image); off, both eyes show the left eye's."
 default = true
 apply = "live"
 

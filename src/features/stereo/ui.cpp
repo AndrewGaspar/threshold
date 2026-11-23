@@ -286,17 +286,23 @@ void* pause_tex(void* r, int i, int w, int h, int fmt) {
 void __fastcall hk_capture(void* r, void* tex2d) {
   o_capture(r, tex2d);
   g_pause.active = false;
-  TH_LOG("stereo ui: pause capture into %p (frame %llu)", tex2d ? g_eng.native(tex2d) : nullptr,
-         (unsigned long long)present_frame());
-  if (!g_pause_on.load() || !g_f_ok || g_f.pack != 1 || !tex2d || !g_eng.back_buffer || !g_eng.copy_region) return;
+  if (!g_pause_on.load() || !g_f_ok || (g_f.pack != 1 && g_f.pack != 2) || !tex2d || !g_eng.back_buffer ||
+      !g_eng.copy_region)
+    return;
   void* dst = g_eng.native(tex2d);
   void* bb = g_eng.back_buffer();
   int w = nt_w(dst), h = nt_h(dst), fmt = dst ? at<int8_t>(dst, kNtPixelFormat) : -1;
   int vx = *reinterpret_cast<int*>(g_ren.at(kRvaViewportOffset)), vy = *reinterpret_cast<int*>(g_ren.at(kRvaViewportOffset + 4));
-  // The left eye is what the engine copied ([vx, vx + w) of the 2W back buffer); the right eye is
-  // the same region one eye width to the right.
-  if (!dst || !bb || w != g_f.w || nt_w(bb) < vx + 2 * w || nt_h(bb) < vy + h) {
-    TH_LOG("stereo ui: pause capture %dx%d not per eye (back buffer %dx%d, eye %d)", w, h, nt_w(bb), nt_h(bb), g_f.w);
+  void* sbs = g_f.sbs_native;
+  // full/sbs: the left eye is what the engine copied ([vx, vx + w) of the 2W back buffer), the right
+  // eye the same region one eye width to the right. hsbs: the back buffer holds both eyes squeezed
+  // (the engine's copy is the squeezed pair), so both eyes come from the side-by-side texture, 1:1
+  // (the frame before `end`'s gamma blit; identity in SDR at the default brightness, see docs).
+  bool from_sbs = g_f.pack == 2;
+  if (!dst || !bb || w != g_f.w || (!from_sbs && (nt_w(bb) < vx + 2 * w || nt_h(bb) < vy + h)) ||
+      (from_sbs && (!sbs || nt_w(sbs) != 2 * w || nt_h(sbs) != h || at<int8_t>(sbs, kNtPixelFormat) != fmt))) {
+    TH_LOG("stereo ui: pause capture %dx%d f%d not per eye (back buffer %dx%d, side-by-side %dx%d f%d, eye %d)", w, h,
+           fmt, nt_w(bb), nt_h(bb), nt_w(sbs), nt_h(sbs), sbs ? int(at<int8_t>(sbs, kNtPixelFormat)) : -1, g_f.w);
     return;
   }
   void* L = pause_tex(r, 0, w, h, fmt);
@@ -304,8 +310,15 @@ void __fastcall hk_capture(void* r, void* tex2d) {
   if (!L || !R) return;
   void* Ln = g_eng.native(L);
   void* Rn = g_eng.native(R);
-  int z[3] = {0, 0, 0}, src[3] = {vx + w, vy, 0}, size[3] = {w, h, 1};
-  g_eng.copy_region(Rn, 0, 0, z, bb, 0, 0, src, size);
+  int z[3] = {0, 0, 0}, size[3] = {w, h, 1};
+  if (from_sbs) {
+    int right[3] = {w, 0, 0};
+    g_eng.copy_region(Rn, 0, 0, z, sbs, 0, 0, right, size);
+    g_eng.copy_region(dst, 0, 0, z, sbs, 0, 0, z, size);
+  } else {
+    int src[3] = {vx + w, vy, 0};
+    g_eng.copy_region(Rn, 0, 0, z, bb, 0, 0, src, size);
+  }
   g_eng.copy_region(Ln, 0, 0, z, dst, 0, 0, z, size);
   g_pause.dst = dst;
   g_pause.dst_res = at<ID3D12Resource*>(dst, kNtResource);
@@ -428,7 +441,7 @@ void ui_frame(const UiFrame& f) {
 
 void ui_pair_rendered() { g_pause.active = false; }
 
-bool ui_pause_sbs() { return g_pause_on.load() && g_pause.active && o_capture && g_f_ok && g_f.pack == 1; }
+bool ui_pause_sbs() { return g_pause_on.load() && g_pause.active && o_capture && g_f_ok && g_f.pack != 0; }
 
 void ui_hud_begin(bool sbs, int w) {
   g_hud_sbs = sbs && o_set_const;

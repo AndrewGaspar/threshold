@@ -45,6 +45,7 @@ struct UiFrame {
   int shift[2] = {0, 0};     // image-shift convergence per eye (px)
   double cam_pos[3] = {}, cam_fwd[3] = {};  // the centre camera
   int render_w = 0, render_h = 0;
+  void* sbs_native = nullptr;  // the side-by-side texture (NativeTexture*, 2W x H): eyes + HUD, pre-gamma
 };
 void ui_frame(const UiFrame& f);  // after the pair's world renders, before renderHUD
 // renderHUD of a frame without a pair: true if the UI wants it side by side (the pause background

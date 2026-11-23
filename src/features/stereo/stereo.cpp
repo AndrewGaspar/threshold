@@ -877,6 +877,7 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
   uf.shift[0] = g_shift[0], uf.shift[1] = g_shift[1];
   for (int k = 0; k < 3; k++) uf.cam_fwd[k] = m[6 + k], uf.cam_pos[k] = m[9 + k];
   uf.render_w = rglob<int>(kRvaRenderSize), uf.render_h = rglob<int>(kRvaRenderSize + 4);
+  uf.sbs_native = g_sbs ? gpu_native(g_sbs) : nullptr;
   ui_frame(uf);
   ui_pair_rendered();
 }
@@ -938,6 +939,7 @@ void __fastcall hk_renderHUD(void* r) {
            where(reinterpret_cast<uintptr_t>(paint)).c_str());
   }
   if (!g_pair) {
+    if (engine_loading()) ui_pair_rendered();  // quit to menu, a load: the pause background ends
     if (!ui_pause_sbs() || !packed_now() || !gpu_ready() || params().mode != Mode::Sbs) {
       ui_hud_begin(false, rglob<int>(kRvaOutputSize));
       o_renderHUD(r);
@@ -1011,9 +1013,7 @@ void __fastcall hk_renderHUD(void* r) {
   if (p.hud_both) gpu_dup_arm(w);
   if (p.hud_both && o_rt_alloc && g_hud_wide_on.load()) g_hud_hdr_w = w;
   ui_hud_begin(p.hud_both, w);
-  g_hud_ds_clear = true;
   o_renderHUD(r);
-  g_hud_ds_clear = false;
   ui_hud_end();
   g_hud_hdr_w = 0;
   gpu_dup_arm(0);
