@@ -177,7 +177,8 @@ constexpr uintptr_t kRvaD3DRtAsyncUpload = 0x136d20;
 // High-res screenshot tiles (slots 25-27 write them): the renderer's own "several renders per
 // update" guards compare them. The graph's Cleanup pass refreshes object previous transforms
 // (Object +0xa0 <- +0x70, renderer+0x134040) and the ambient probe updates (renderer+0x211c80) only
-// when index == count, i.e. on the last tile.
+// when index == count, i.e. on the last tile. Stereo holds the count only inside the Cleanup pass
+// (eyestate.cpp tile_hold 2): holding it for the whole left render also skipped the probe there.
 constexpr uintptr_t kRvaTileIndex = 0x802978;
 constexpr uintptr_t kRvaTileCount = 0x80297c;
 
