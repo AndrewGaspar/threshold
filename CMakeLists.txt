@@ -43,6 +43,7 @@ add_library(threshold SHARED
   src/features/stereo/gpu.cpp
   src/features/stereo/eyestate.cpp
   src/features/stereo/window.cpp
+  src/features/stereo/ui.cpp
   src/dxgi.def)
 set_target_properties(threshold PROPERTIES OUTPUT_NAME dxgi PREFIX "")
 target_include_directories(threshold PRIVATE src third_party third_party/DLSS-310.9.16/include)

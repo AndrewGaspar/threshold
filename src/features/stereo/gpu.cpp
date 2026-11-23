@@ -338,35 +338,83 @@ void STDMETHODCALLTYPE hk_setsc(ID3D12GraphicsCommandList* cl, UINT n, const D3D
   if (n >= 1 && r) t_sc = r[0], t_sc_set = true;
   o_setsc(cl, n, r);
 }
-// Around the second issue of a draw: viewport and scissor moved by dx, then put back.
+std::atomic<DupCb> g_dup_cb{nullptr};
+std::atomic<DWORD> g_obs_tid{0};
+std::atomic<bool> g_obs{false};
+bool obs_on() {
+  return g_obs.load(std::memory_order_relaxed) && GetCurrentThreadId() == g_obs_tid.load(std::memory_order_relaxed);
+}
+D3D12_RECT cur_scissor() {
+  return t_sc_set ? t_sc
+                  : D3D12_RECT{LONG(t_vp.TopLeftX), LONG(t_vp.TopLeftY), LONG(t_vp.TopLeftX + t_vp.Width),
+                               LONG(t_vp.TopLeftY + t_vp.Height)};
+}
+// One issue of a draw with the viewport moved by `off` pixels (fractional allowed) and the scissor
+// by its rounded value, clipped to [lo, hi) when hi > lo (the eye's half); then put back.
 template <typename F>
-void again(ID3D12GraphicsCommandList* cl, F&& draw) {
-  if (!t_vp_set) return;
-  int dx = g_dup_dx.load();
+void issue_at(ID3D12GraphicsCommandList* cl, float off, int lo, int hi, F&& draw) {
+  if (!t_vp_set || (off == 0 && hi <= lo)) {
+    draw();
+    return;
+  }
   D3D12_VIEWPORT v = t_vp;
-  v.TopLeftX += float(dx);
-  D3D12_RECT sc = t_sc_set ? t_sc
-                           : D3D12_RECT{LONG(t_vp.TopLeftX), LONG(t_vp.TopLeftY), LONG(t_vp.TopLeftX + t_vp.Width),
-                                        LONG(t_vp.TopLeftY + t_vp.Height)};
-  D3D12_RECT sc0 = sc;
-  sc.left += dx;
-  sc.right += dx;
+  v.TopLeftX += off;
+  D3D12_RECT sc = cur_scissor(), sc0 = sc;
+  LONG o = LONG(std::lround(off));
+  sc.left += o;
+  sc.right += o;
+  if (hi > lo) {
+    sc.left = std::max<LONG>(sc.left, lo);
+    sc.right = std::min<LONG>(sc.right, hi);
+    if (sc.right <= sc.left) return;  // entirely outside its half
+  }
   o_setvp(cl, 1, &v);
   o_setsc(cl, 1, &sc);
   draw();
   o_setvp(cl, 1, &t_vp);
   o_setsc(cl, 1, &sc0);
+}
+// A draw while armed or observing: the original issue (shifted if the callback says so) and, armed,
+// the duplicate moved right by dx plus its own shift. Without a callback (or with no shift) the
+// draws are issued exactly as before the UI hook existed.
+template <typename F>
+void issue(ID3D12GraphicsCommandList* cl, UINT count, UINT start, INT base, F&& draw) {
+  bool dup = dup_on();
+  DupCb cb = g_dup_cb.load(std::memory_order_relaxed);
+  if (!dup && !(cb && obs_on())) {
+    draw();
+    return;
+  }
+  DupDraw d;
+  d.count = count, d.start = start, d.base = base;
+  d.vp_x = t_vp.TopLeftX, d.vp_y = t_vp.TopLeftY, d.vp_w = t_vp.Width, d.vp_h = t_vp.Height;
+  d.dx = dup ? g_dup_dx.load() : 0;
+  if (cb) cb(cl, 0, d);
+  bool moved = d.shift[0] != 0 || d.shift[1] != 0;
+  if (!dup) {
+    issue_at(cl, d.shift[0], 0, 0, draw);
+    return;
+  }
+  issue_at(cl, d.shift[0], 0, moved ? d.dx : 0, draw);
+  if (!t_vp_set) return;
+  if (cb) cb(cl, 1, d);
+  issue_at(cl, float(d.dx) + d.shift[1], moved ? d.dx : 0, moved ? 2 * d.dx : 0, draw);
+  if (cb) cb(cl, 2, d);
   g_n_dup_draws++;
 }
 void STDMETHODCALLTYPE hk_draw(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, UINT d) {
-  o_draw(cl, a, b, c, d);
-  if (dup_on()) again(cl, [&] { o_draw(cl, a, b, c, d); });
+  issue(cl, a, c, 0, [&] { o_draw(cl, a, b, c, d); });
 }
 void STDMETHODCALLTYPE hk_drawidx(ID3D12GraphicsCommandList* cl, UINT a, UINT b, UINT c, INT d, UINT e) {
-  o_drawidx(cl, a, b, c, d, e);
-  if (dup_on()) again(cl, [&] { o_drawidx(cl, a, b, c, d, e); });
+  issue(cl, a, c, d, [&] { o_drawidx(cl, a, b, c, d, e); });
 }
 }  // namespace
+
+void gpu_dup_callback(DupCb cb) { g_dup_cb = cb; }
+void gpu_draw_observe(bool on) {
+  g_obs_tid = GetCurrentThreadId();
+  g_obs = on;
+}
 
 bool gpu_dup_install() {
   if (o_draw) return true;
@@ -592,6 +640,106 @@ std::string gpu_status() {
            (unsigned long long)g_n_kick.load(), (unsigned long long)g_n_capture.load(),
            (unsigned long long)g_n_fail.load(), (unsigned long long)g_n_untracked.load());
   return b;
+}
+
+
+bool gpu_copy_on(ID3D12GraphicsCommandList* cl, void* src_nt, void* dst_nt) {
+  Tex s, d;
+  if (!cl || !engine_tex(src_nt, s) || !engine_tex(dst_nt, d) || s.r == d.r) return g_n_fail++, false;
+  D3D12_RESOURCE_DESC sd = s.r->GetDesc(), dd = d.r->GetDesc();
+  int w = int(std::min<UINT64>(sd.Width, dd.Width)), h = int(std::min(sd.Height, dd.Height));
+  enter(cl, s, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  enter(cl, d, D3D12_RESOURCE_STATE_COPY_DEST);
+  copy_box(cl, d.r, 0, 0, s.r, 0, 0, w, h);
+  leave(cl, d, D3D12_RESOURCE_STATE_COPY_DEST);
+  leave(cl, s, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  g_n_copy++;
+  return true;
+}
+
+// Texel probes: a persistently mapped readback buffer, kProbeRing x kProbeSlots placed footprints
+// of one texel (512-byte aligned each).
+namespace {
+ID3D12Resource* g_probe_buf = nullptr;
+uint8_t* g_probe_map = nullptr;
+DXGI_FORMAT g_probe_fmt[kProbeRing][kProbeSlots] = {};
+constexpr UINT64 kProbeStride = 512;
+float half_to_float(uint16_t h) {
+  uint32_t s = (h >> 15) & 1, e = (h >> 10) & 0x1f, m = h & 0x3ff;
+  float v = e == 0 ? std::ldexp(float(m), -24) : e == 31 ? INFINITY : std::ldexp(float(m | 0x400), int(e) - 25);
+  return s ? -v : v;
+}
+}  // namespace
+
+bool gpu_probe(ID3D12GraphicsCommandList* cl, void* nt, int ring, int slot, int x, int y) {
+  Tex t;
+  if (!cl || !g_dev || ring < 0 || ring >= kProbeRing || slot < 0 || slot >= kProbeSlots || !engine_tex(nt, t))
+    return false;
+  if (!g_probe_buf) {
+    D3D12_HEAP_PROPERTIES hp{};
+    hp.Type = D3D12_HEAP_TYPE_READBACK;
+    D3D12_RESOURCE_DESC bd{};
+    bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+    bd.Width = kProbeStride * kProbeSlots * kProbeRing;
+    bd.Height = 1;
+    bd.DepthOrArraySize = 1;
+    bd.MipLevels = 1;
+    bd.SampleDesc.Count = 1;
+    bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+    if (FAILED(g_dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                              __uuidof(ID3D12Resource), (void**)&g_probe_buf)))
+      return false;
+    void* p = nullptr;
+    D3D12_RANGE r{0, SIZE_T(bd.Width)};
+    if (FAILED(g_probe_buf->Map(0, &r, &p))) {
+      g_probe_buf->Release();
+      g_probe_buf = nullptr;
+      return false;
+    }
+    g_probe_map = static_cast<uint8_t*>(p);
+    memset(g_probe_map, 0, size_t(bd.Width));
+  }
+  D3D12_RESOURCE_DESC d = t.r->GetDesc();
+  DXGI_FORMAT f = d.Format;
+  if (f != DXGI_FORMAT_R16_FLOAT && f != DXGI_FORMAT_R32_FLOAT && f != DXGI_FORMAT_R32_TYPELESS &&
+      f != DXGI_FORMAT_D32_FLOAT && f != DXGI_FORMAT_R16_TYPELESS)
+    return false;
+  x = std::max(0, std::min(int(d.Width) - 1, x));
+  y = std::max(0, std::min(int(d.Height) - 1, y));
+  D3D12_TEXTURE_COPY_LOCATION dst{}, src{};
+  dst.pResource = g_probe_buf;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint.Offset = (UINT64(ring) * kProbeSlots + slot) * kProbeStride;
+  dst.PlacedFootprint.Footprint.Format = f == DXGI_FORMAT_D32_FLOAT ? DXGI_FORMAT_R32_TYPELESS : f;
+  dst.PlacedFootprint.Footprint.Width = 1;
+  dst.PlacedFootprint.Footprint.Height = 1;
+  dst.PlacedFootprint.Footprint.Depth = 1;
+  dst.PlacedFootprint.Footprint.RowPitch = 256;
+  src.pResource = t.r;
+  src.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  D3D12_BOX box{UINT(x), UINT(y), 0, UINT(x + 1), UINT(y + 1), 1};
+  enter(cl, t, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  cl->CopyTextureRegion(&dst, 0, 0, 0, &src, &box);
+  leave(cl, t, D3D12_RESOURCE_STATE_COPY_SOURCE);
+  g_probe_fmt[ring][slot] = f;
+  return true;
+}
+
+bool gpu_probe_value(int ring, int slot, float* v) {
+  if (!g_probe_map || ring < 0 || ring >= kProbeRing || slot < 0 || slot >= kProbeSlots) return false;
+  DXGI_FORMAT f = g_probe_fmt[ring][slot];
+  const uint8_t* p = g_probe_map + (UINT64(ring) * kProbeSlots + slot) * kProbeStride;
+  if (f == DXGI_FORMAT_R16_FLOAT || f == DXGI_FORMAT_R16_TYPELESS) {
+    uint16_t h;
+    memcpy(&h, p, 2);
+    *v = half_to_float(h);
+    return true;
+  }
+  if (f == DXGI_FORMAT_R32_FLOAT || f == DXGI_FORMAT_R32_TYPELESS || f == DXGI_FORMAT_D32_FLOAT) {
+    memcpy(v, p, 4);
+    return true;
+  }
+  return false;
 }
 
 }  // namespace th::stereo

@@ -41,6 +41,7 @@
 #include "features/stereo/engine.h"
 #include "features/stereo/eyestate.h"
 #include "features/stereo/gpu.h"
+#include "features/stereo/ui.h"
 #include "features/stereo/window.h"
 
 namespace th {
@@ -148,7 +149,7 @@ int g_pair_w = 0, g_pair_h = 0;
 int g_shift[2] = {0, 0};      // convergence image shift per eye (px), sbs with conv_shift
 std::atomic<int> g_eye_now{0};
 std::atomic<uint64_t> g_n_worlds{0}, g_n_pairs{0}, g_n_biased{0}, g_n_hud2{0}, g_n_dup{0}, g_n_mono_fallback{0};
-std::atomic<uint64_t> g_n_created_color{0}, g_n_mono_dup{0};
+std::atomic<uint64_t> g_n_created_color{0}, g_n_mono_dup{0}, g_n_pause_sbs{0};
 void* g_renderer = nullptr;
 IDXGISwapChain* g_sc = nullptr;
 double g_last_m00 = 0;
@@ -863,6 +864,22 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
   g_pair = ok;
   g_pair_w = w, g_pair_h = h;
   if (ok) g_n_pairs++;
+  // The UI layer (world markers' depth, the pause background): this pair's centre camera and stereo.
+  UiFrame uf;
+  uf.w = w, uf.h = h, uf.pack = g_pack.load();
+  uf.sep_m = p.separation_mm / 1000.0;
+  uf.conv_m = p.convergence_m;
+  const double* c = reinterpret_cast<const double*>(static_cast<const uint8_t*>(view) + kMViewToClip);
+  const double* m = reinterpret_cast<const double*>(static_cast<const uint8_t*>(view) + kMViewToWorld);
+  uf.m00 = c[0] > 0.05 && c[0] < 50 ? c[0] : 0;
+  uf.sign = p.swap ? -1 : 1;
+  uf.proj_conv = !shift_conv;
+  uf.shift[0] = g_shift[0], uf.shift[1] = g_shift[1];
+  for (int k = 0; k < 3; k++) uf.cam_fwd[k] = m[6 + k], uf.cam_pos[k] = m[9 + k];
+  uf.render_w = rglob<int>(kRvaRenderSize), uf.render_h = rglob<int>(kRvaRenderSize + 4);
+  uf.sbs_native = g_sbs ? gpu_native(g_sbs) : nullptr;
+  ui_frame(uf);
+  ui_pair_rendered();
 }
 
 // HDR: renderHUD paints the UI into a separate target ("RendererX86::pSeparateHudColorTarget", RGBA8,
@@ -892,6 +909,23 @@ void* __fastcall hk_rt_alloc(void* mgr, const void* init, const char* name) {
   return o_rt_alloc(mgr, init, name);
 }
 
+// The HUD depth-stencil of a side-by-side renderHUD (engine.h kExpAllocDepth): cleared like the
+// engine clears its own (depth 1, stencil 0) right after renderHUD allocates it.
+using AllocDepth_t = void*(__fastcall*)(void* mgr, const void* init, const char* name);
+using ClearDS_t = void(__cdecl*)(void* ds, void* nt, float depth, uint8_t stencil, int flags);
+AllocDepth_t o_alloc_depth;
+ClearDS_t g_clear_ds;
+std::atomic<bool> g_hud_ds_clear{false};
+std::atomic<uint64_t> g_n_hud_ds_clear{0};
+void* __fastcall hk_alloc_depth(void* mgr, const void* init, const char* name) {
+  void* d = o_alloc_depth(mgr, init, name);
+  if (d && g_hud_ds_clear.load(std::memory_order_relaxed) && name && strcmp(name, "RendererX86::pHudDepthStencil") == 0) {
+    void* nt = *reinterpret_cast<void**>(d);
+    if (nt) g_clear_ds(g_retrieve_ds(), nt, 1.0f, 0, 6), g_n_hud_ds_clear++;
+  }
+  return d;
+}
+
 // The HUD of a side-by-side frame: the engine's HUD pass draws into the colour target (+0x3c8)
 // once per eye, and each eye + HUD is collected into its half of the side-by-side texture that
 // `end` then blits (hk_end).
@@ -905,7 +939,41 @@ void __fastcall hk_renderHUD(void* r) {
            where(reinterpret_cast<uintptr_t>(paint)).c_str());
   }
   if (!g_pair) {
+    if (engine_loading()) ui_pair_rendered();  // quit to menu, a load: the pause background ends
+    if (!ui_pause_sbs() || !packed_now() || !gpu_ready() || params().mode != Mode::Sbs) {
+      ui_hud_begin(false, rglob<int>(kRvaOutputSize));
+      o_renderHUD(r);
+      ui_hud_end();
+      return;
+    }
+    // The pause menu over a per-eye background (ui.cpp): the HUD pass runs over the side-by-side
+    // texture with every draw repeated in the right half, where the background draw samples the
+    // right eye's capture. `end` then blits it like a pair.
+    int w = rglob<int>(kRvaOutputSize), h = rglob<int>(kRvaOutputSize + 4);
+    void* sbs = g_sbs;  // the pairs' side-by-side texture (the colour target's format)
+    if (cct || !sbs || g_sbs_w != 2 * w || g_sbs_h != h) {  // a colour target already set: leave it
+      o_renderHUD(r);
+      return;
+    }
+    static const float black[4] = {0, 0, 0, 1};
+    g_clear_rt(g_retrieve_ds(), gpu_native(sbs), black);
+    at<void*>(r, kRCreatedColor) = sbs;
+    uint8_t owned = at<uint8_t>(r, kRCreatedOwned);
+    at<uint8_t>(r, kRCreatedOwned) = 0;
+    gpu_dup_arm(w);
+    if (o_rt_alloc && g_hud_wide_on.load()) g_hud_hdr_w = w;
+    ui_hud_begin(true, w);
+    g_hud_ds_clear = true;
     o_renderHUD(r);
+    g_hud_ds_clear = false;
+    ui_hud_end();
+    g_hud_hdr_w = 0;
+    gpu_dup_arm(0);
+    // +0x3c8 stays the side-by-side texture (not owned): `end` blits it and clears it.
+    (void)owned;
+    g_shift[0] = g_shift[1] = 0;
+    g_n_pause_sbs++;
+    g_composed = true;
     return;
   }
   g_pair = false;
@@ -944,7 +1012,9 @@ void __fastcall hk_renderHUD(void* r) {
   at<uint8_t>(r, kRCreatedOwned) = 0;
   if (p.hud_both) gpu_dup_arm(w);
   if (p.hud_both && o_rt_alloc && g_hud_wide_on.load()) g_hud_hdr_w = w;
+  ui_hud_begin(p.hud_both, w);
   o_renderHUD(r);
+  ui_hud_end();
   g_hud_hdr_w = 0;
   gpu_dup_arm(0);
   at<void*>(r, kRCreatedColor) = cct;
@@ -1115,12 +1185,12 @@ std::string status_json() {
     std::lock_guard lk(g_pmu);
     raw_mode = mode_name(g_p.mode);
   }
-  char b[3072];
+  char b[6144];
   snprintf(b, sizeof b,
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s,\"pause_sbs\":%llu,\"hud_ds_clear\":%llu,\"ui\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1131,7 +1201,8 @@ std::string status_json() {
            (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_rt_upd_skipped.load(), (unsigned long long)g_n_tlas_skipped.load(), (unsigned long long)g_n_left_builds.load(), (unsigned long long)g_n_left_compactions.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
-           eyestate_status().c_str(), window_status().c_str());
+           eyestate_status().c_str(), window_status().c_str(), (unsigned long long)g_n_pause_sbs.load(),
+           (unsigned long long)g_n_hud_ds_clear.load(), ui_status().c_str());
   return b;
 }
 
@@ -1287,6 +1358,8 @@ void stereo_register() {
       g_rt_async_keep = truthy(v);
     } else if (id == "stereo.hdr_hud_wide") {
       g_hud_wide_on = truthy(v);
+    } else if (id == "stereo.ui_markers" || id == "stereo.ui_pause") {
+      ui_option(id, v);
     } else if (id == "stereo.hyprland_tag") {
       g_tag_on = !(v == "0" || v == "false" || v == "off");
       update_tag();
@@ -1331,6 +1404,7 @@ void stereo_register() {
       return json_str(std::string(r ? "set " : "failed ") + name + " = " + a.back());
     }
     if (sub == "graph") return eyestate_graph();
+    if (sub == "ui") return ui_verb(a, ok);
     if (sub == "fences") {
       fence_dump(a.size() > 1 ? atoi(a[1].c_str()) : 300);
       return json_str("dumped to threshold.log");
@@ -1388,6 +1462,21 @@ void stereo_start() {
     return;
   }
   eyestate_start(g_rimg);
+  if (g_pack.load() != 0) {
+    void* ad = module_export(kRenderer, kExpAllocDepth, "stereo");
+    g_clear_ds = reinterpret_cast<ClearDS_t>(module_export(kD3D, kExpClearDS, "stereo"));
+    if (!ad || !g_clear_ds || !sig_match(ad, kSigAllocDepth) || !sig_match((void*)g_clear_ds, kSigClearDS) ||
+        !hook_fn(ad, (void*)hk_alloc_depth, (void**)&o_alloc_depth, "RenderTargetManager::allocDepthBuffer"))
+      TH_LOG("stereo: allocDepthBuffer/clearDepthStencil missing or signature mismatch: the HUD depth-stencil is not cleared");
+    UiEngine ue;
+    ue.copy_region = g_copy_region;
+    ue.tex2d_init = g_tex2d_init;
+    ue.rt_alloc = g_rt_alloc;
+    ue.rt_free = g_rt_free;
+    ue.native = gpu_native;
+    ue.back_buffer = gpu_back_buffer;
+    ui_start(g_rimg, ue);
+  }
   if (cfg_bool("stereo.fence_trace", false)) fence_trace_start();
   level_hooks_start();
   if (cfg_bool("stereo.hdr_hud_wide", true) &&

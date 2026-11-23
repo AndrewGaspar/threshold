@@ -23,6 +23,10 @@ title = "Stereoscopic 3D"
 options = ["stereo.mode", "stereo.output", "stereo.hyprland_tag", "stereo.separation", "stereo.convergence", "stereo.swap_eyes"]
 
 [[page.group]]
+title = "HUD in 3D"
+options = ["stereo.ui_markers", "stereo.ui_pause"]
+
+[[page.group]]
 title = "Temporal effects in 3D"
 options = ["stereo.per_eye", "stereo.dlss_per_eye"]
 
@@ -239,6 +243,20 @@ type = "bool"
 label = "Swap eyes"
 help = "Cross-eyed viewing, or a display that expects the right eye on the left."
 default = false
+apply = "live"
+
+[option."stereo.ui_markers"]
+type = "bool"
+label = "World markers at their depth"
+help = "Objective, interaction and collectible markers are drawn at the depth of what they mark, or just in front of a wall that hides it, instead of at the screen plane with the rest of the HUD."
+default = true
+apply = "live"
+
+[option."stereo.ui_pause"]
+type = "bool"
+label = "3D pause background"
+help = "The pause menu keeps a 3D background (each eye its own image); off, both eyes show the left eye's."
+default = true
 apply = "live"
 
 [option."stereo.per_eye"]
