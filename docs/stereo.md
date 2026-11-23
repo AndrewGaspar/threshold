@@ -386,7 +386,7 @@ pixels' centroid in each half vs patch matches of the scene around it; disparity
 | r6, lobby, checkpoint interaction marker, visible (anchor 18.2 m, surface behind 23.3 m) | at the anchor | **-18.64 px** (expected -18.62) | the red lamp beside it -18.64, -18.56 px; the desk below -17.85 px |
 | r12, the same marker over its sign (anchor 17.0 m, the sign's surface 15.2 m) | obstructed: 0.97 x 15.2 = 14.7 m | **-17.21 px** (expected -17.34) | the sign -17.84, -18.04 px (the marker is just in front) |
 | r13, `[fg] count = 2` (projection convergence), the visible marker | at the anchor (18.2 m) | **-19.08 px** (expected -19.10) | the lamp -19.06, -19.06 px |
-| r16 (final build): on / `ui_markers = 0` live / on again after a pause | anchor (18.2 m) / screen plane / anchor | **-18.76 / 0.00 / -18.76 px** | -18.62, -18.60 px |
+| r16 (final build) and r17 (merged with main 577bde0): on / `ui_markers = 0` live / on again after a pause | anchor (18.2 m) / screen plane / anchor | **-18.76 / 0.00 / -18.76 px** | -18.62, -18.60 px |
 | before (main) | screen plane | 0 px (identical in both halves) | |
 
 Off-screen interaction markers are not drawn by the game (r12: the projection clamps, no edge arrow
@@ -430,7 +430,7 @@ Measured (r12, lobby, the same capture conditions; `stereo_disparity.py` per hal
 | paused, `ui_pause = 1` | **-16.39 px**, -19.9..+19.5 | **-18.14 px** | **0 px, 0.00/255** |
 | paused, `ui_pause = 0` (main's behaviour) | -0.00 px | 0.00 px | 0 px, 0.00/255 |
 | r13, 2x FG: in the world / paused | | -18.68 / **-18.69 px** | menu in both halves (screenshot) |
-| r16 (final build), paused | | **-18.11 px** | 0.00/255 |
+| r16 (final build) / r17 (merged with main), paused | | **-18.11 / -18.14 px** | 0.00/255 both |
 
 The menu is identical in both halves; the background keeps the world's disparity field.
 
@@ -1035,7 +1035,7 @@ waits never satisfied as `STUCK`.
   layer"), with and without 2x FG. Code: `src/features/stereo/ui.cpp` (hooks, markers, pause),
   gpu.cpp (per-draw callback: per-eye viewport shift with the scissor kept in its half, copies on the
   engine's list mid-pass, texel probes), stereo.cpp (pause path in `renderHUD`, `UiFrame` per pair).
-- **Lab.** rayblaster instance `control-ui` (display 3840x1080@60 so `output = full` shows both eyes
+- **Lab.** rayblaster instance `control-ui` (down; display 3840x1080@60 so `output = full` shows both eyes
   1:1; GE-Proton11-12; renderer.ini copied from `control-stereo`: DLAA, all RT on). The `game-start`
   lobby has one interaction marker: from `tools/lab/continue control-ui --mod DIR`, turn right
   `quiver lab mouse control-ui 330 0 --steps 10`: the checkpoint's marker at ~(950, 450), 18 m.
