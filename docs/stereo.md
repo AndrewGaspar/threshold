@@ -400,6 +400,14 @@ R(n−1) to R(n).
 | r4 c0sh | **negative control**: one feature for both eyes (`[fg] stereo_features = 1`) | 0.494 / **0.959**, 0.510 / **0.966** | **23.19** / 12.17, **22.93** / 12.34 px | **17.6, 18.5 px** | 0.37, 0.40 px |
 | r5 p2x | 2x, projection convergence (the default with FG) | 0.502 / 0.505, 0.510 / 0.504 | −14.40 / −14.40, −15.08 / −14.66 px | 0.41, 0.49 px | 0.46, 0.54 px |
 | r5 p4xb | 4x, projection | 0.251 / 0.251, 0.500 / 0.501, 0.750 / 0.751 | −11.93 / −12.00 ... | 0.27-0.52 px | 0.65 px |
+| r48 rt4x | 4x, projection, **all RT effects on**, display 1920x1080 (`control-stereo`) | 0.237 / 0.238, 0.475 / 0.476, 0.713 / 0.713 | −15.2 / −11.7, −14.9 / −11.9, −14.8 / −12.8 px | 0.82, 0.65, 0.42 px | 0.81 px |
+
+r48 (`tools/fg/stereo-grab control-stereo OUT rt4x 2 2`, one job captured while turning): both eyes
+sit at the same fraction of the step, the generated frames' disparity moves no more than the real
+frames' own does between them, and each generated eye is nearer its own eye's real frame than the
+other eye's (err same / other eye: 3.9 / 5.4, 3.3 / 4.9, 2.6 / 4.7 left; 3.9 / 5.8, 3.4 / 5.3,
+2.7 / 4.8 right). The ratios sit ~5 % under k/m in both eyes alike (the turn was faster here than in
+r5, at a lower rendered rate).
 
 - **Each eye's generated frames are that eye's.** Both eyes interpolate at k/m, and the disparity of
   generated frames equals the real frames' to within the real frames' own frame-to-frame change.
@@ -507,8 +515,8 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 
 ## Open issues
 
-- **Stereo + FG** (works, measured above, including 20 level changes): not tested with RT on (the RT
-  fault below comes first) or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
+- **Stereo + FG** (works, measured above, including 20 level changes, and with all RT effects on,
+  r48): not tested on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
   rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
 - **Why the right eye's new BLAS builds hang during a level change** (Xid 109, r41/r42) is not
@@ -598,6 +606,8 @@ the world), so the frame stays mono while the engine changes level and until BLA
 | r42 | `as_once = 5` (builds only) | **10 min in the world, no fault** (5480 new builds run); first teleport: `Xid 109` |
 | r43 | `as_once = 5`, `load_mono = 1` | **22 teleports in 610 s, no Xid, no `signaller_worker` timeout** |
 | r45 | the shipped defaults (main 0a5eb41 merged in, `as_once = 5`, `load_mono = 1`) | **10 min in the world, then 9 teleports in 256 s: no Xid, no `signaller_worker` timeout** (7 level changes settled back to 3D) |
+| r47 | shipped defaults, **all RT effects on** (renderer.ini: reflections 2, transparent 2, indirect diffuse 2, contact shadows 2, debris 1; the user's preset) | **10 min in the world, then 11 teleports in 309 s: no Xid, no `signaller_worker` timeout** |
+| r48 | as r47 with `[fg] enabled = 1`, `count = 4` | **5 min in the world, then 5 teleports: no Xid, no `signaller_worker` timeout**, FG `fail 0`, 105 rendered + 315 generated presents/s in the lobby; per-eye check below |
 
 Leads checked and ruled out: the eye's `m::View` copy is not kept past `renderWorld` (static:
 renderer+0x11daf0 copies it into the renderer's own `rend::View` at +0x678 and clears its only
