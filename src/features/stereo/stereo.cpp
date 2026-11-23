@@ -1202,6 +1202,15 @@ void stereo_register() {
       for (size_t i = 0; i < g_shot_files.size(); i++) r += (i ? "," : "") + json_str(g_shot_files[i]);
       return r + "]";
     }
+    if (sub == "tweak" && a.size() > 2) {  // dev: d::BaseTweakable::setTweakable(name, value) (rl export)
+      using SetTw_t = bool(__cdecl*)(const char*, const char*, bool);
+      auto set = reinterpret_cast<SetTw_t>(module_export(kRl, "?setTweakable@BaseTweakable@d@@SA_NPEBD0_N@Z", "stereo"));
+      std::string name = a[1];
+      for (size_t k = 2; k + 1 < a.size(); k++) name += " " + a[k];  // names contain spaces
+      bool r = set && set(name.c_str(), a.back().c_str(), false);
+      TH_LOG("stereo: tweak '%s' = %s -> %d", name.c_str(), a.back().c_str(), int(r));
+      return json_str(std::string(r ? "set " : "failed ") + name + " = " + a.back());
+    }
     if (sub == "graph") return eyestate_graph();
     if (sub == "fences") {
       fence_dump(a.size() > 1 ? atoi(a[1].c_str()) : 300);
