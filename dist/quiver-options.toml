@@ -38,7 +38,7 @@ options = ["fg.count_min", "fg.count_max", "fg.target_hz", "fg.fps_limit", "fg.p
 [option."fg.enabled"]
 type = "bool"
 label = "DLSS Frame Generation"
-help = "DLSS-G frames between rendered ones (RTX 40+); needs the game's DLSS on, any quality. Not with HDR yet."
+help = "DLSS-G frames between rendered ones (RTX 40+); needs the game's DLSS on, any quality."
 default = false
 apply = "restart"
 

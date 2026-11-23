@@ -211,18 +211,56 @@ What the v1 (`ready`) traces show and `smooth` targets:
 Retake: `tools/fg/fg-series control-fg p2 "r4|pace=ready count=4 fps_limit=30" "s4|pace=smooth"
 "r4b|pace=ready" "s4b|pace=smooth" "r4u|pace=ready fps_limit=0" "s4u|pace=smooth"` on an idle GPU.
 
-### 5. `count = auto`
+### 5. `count = auto` (live, rayblaster r2–r4, behaviour only)
 
-**Implemented, not exercised live** (the driver wedged before its run). Pharos's controller without
-Reflex: once a second, from the rendered frames' own work time (arrival interval minus the limiter's
-sleep and the waits for the present thread), within `[count_min, count_max]` (2..4): one step up when
-the game can't hold `target / multiplier` (10 % short, 2 s), one step down when it could hold
-`target / (multiplier − 1)` with 15 % to spare (3 s); a step down undone within 6 s blocks steps down
+Pharos's controller without Reflex: once a second, from the rendered frames' own work time (arrival
+interval minus the limiter's sleep and the waits for the present thread), within `[count_min,
+count_max]` (2..4): one step up when the game can't hold `target / multiplier` (10 % short, 2 s); one
+step down when it could hold `target / (multiplier − 1)` with 15 % to spare **and** DLSS-G finished
+within 0.55 of that shorter interval (3 s). The achievable rate is `min(work rate, fps_limit)`, so a
+manual cap raises the multiplier toward the target. A step down undone within 30 s blocks steps down
 for 10 s, doubling to 60 s; windows below 60 % of the cap change nothing. The rendered rate is capped
-at `target / multiplier` (the limiter above, verified exact at fixed caps), so presents stay at the
-target. `target_hz = 0` uses the display refresh (`fg: display refresh 60 Hz` in the lab, from
-`GetContainingOutput` + `EnumDisplaySettings`). Changes are logged as `fg: count auto 2x -> 3x (...)`.
-In the 60 Hz lab, `auto` means 2x at 30 fps; test with `target_hz = 120` / `240`.
+at `target / multiplier` (the limiter, exact at fixed caps), so presents stay at the target.
+`target_hz = 0` uses the display refresh (`GetContainingOutput` + `EnumDisplaySettings`). Changes are
+logged as `fg: count auto 2x -> 3x (work, real fps, DLSS-G done, target, cap)`.
+
+Live on rayblaster (`control-fg`, gamescope 1920x1080@165, DLSS Quality, RT off), **under lab limits**
+(the user was playing: GPU ≤ 20 %, 6 cores), so these show behaviour, not timing:
+
+- `fg: display refresh 165 Hz` detected; `count = auto` started at 2x with cap 82.5 → 165 presents/s
+  (r2). When the throttled GPU let the game fall to ~53 fps it stepped to 3x (cap 55), and back to
+  2x once it held 82.5 again (r2, 6 s apart: that bounce is why the undo window is now 30 s).
+- `target_hz = 240`: 2x → 3x (cap 80, 240.1 presents/s) when 2x couldn't hold 120 (r2).
+- `fps_limit = 40` (r3): 2x → 3x → 4x within 4 s, then 160 presents/s at 40.0 real fps, no waits;
+  `count_max = 3` then holds 3x (120 presents/s).
+- Oscillation (r4, `target_hz = 240`, final controller): one 2x→3x→2x→3x sequence in the first 30 s
+  of play, then 3x for the rest of the 2 min (40 of 60 perf lines at 3x).
+
+Why it can bounce: the renderer thread's work time only sees the GPU when frames back up, so a game
+capped with headroom (3x at 80) looks able to do 200+ fps; DLSS-G's lag (2–4 ms at the cap vs 15–20 ms
+when GPU-bound) is the better signal and is now required for a step down. A GPU-time measurement
+(timestamp queries around the game's frame) would be better still.
+
+### 6. HDR (live, rayblaster r5, `display.hdr=on`, renderer.ini `m_eAllowHDR 1`)
+
+The game's HDR swapchain is FP16 scRGB (DXGI 10). As in Pharos, DLSS-G gets HDR10: the real frame
+and the HUD-less colour are encoded to PQ BT.2020 R10G10B10A2 (`BackbufferFormat` 24,
+`ColorBuffersHDR = 1`), and each generated frame is decoded back to scRGB for presenting (`hdr.cpp`:
+two compute shaders from Pharos's `color.cpp`, compiled at start with the game's
+`d3dcompiler_47.dll`, on our own list). In HDR the colour target at renderHUD entry is FP16 too (pixel
+format 23, DXGI 10), so HUD-less works unchanged (it is encoded like the real frame).
+
+`quiver lab shot --hdr` (scRGB raw), still camera, 2x, `show` = real / generated / hudless / real:
+
+| comparison | mean abs luminance difference (outside the hint box) | p99 | hint box |
+|---|---|---|---|
+| real vs real (two captures) | 0.17 nits | 3.0 | 0.02 |
+| generated vs real | 0.20–0.24 nits | 3.6–4.4 | 0.09 |
+| HUD-less vs real | 0.23 nits | 4.7 | 24.5 (HUD gone: 3.2 vs 24.7 nits mean) |
+
+Frame stats: max 249–266 nits, average 12, p99 142–144 for all four; no NaN or negative values. The
+PQ round trip is right (generated ≈ real to within capture noise), and the HUD survives in generated
+frames. The present trace's bands assume 4-byte pixels: in HDR they are not decodable yet.
 
 ## Options (`[fg]`)
 
@@ -241,7 +279,7 @@ In the 60 Hz lab, `auto` means 2x at 30 fps; test with `target_hz = 120` / `240`
 | `show` | all | `generated` / `real` / `hudless` (the HUD-less copy instead of real frames, generated frames off) for debugging and captures |
 | `buffers` | 3 | real swapchain buffers while enabled |
 
-Needs the game's DLSS on (any quality including DLAA). HDR (FP16 scRGB swapchain) is refused for now.
+Needs the game's DLSS on (any quality including DLAA). HDR (FP16 scRGB swapchain) works through the PQ conversion (6).
 Menus, loading screens and the game's pre-rendered video cutscenes don't run DLSS, so they have no
 inputs and are presented as rendered (`no input` in the perf line); generation resumes in-world.
 
@@ -264,52 +302,41 @@ installed with `enabled = 1`.
   brightness, or take the HUD-less image after `end`'s blit.
 - Reflex: the game has none; latency markers/sleep would have to be injected (Pharos did, through
   dxvk-nvapi). The limiter is a plain CPU sleep on the renderer thread.
-- HDR: DLSS-G needs PQ-encoded input for an scRGB swapchain (Pharos converts); HUD-less in HDR would
-  come from `pSeparateHudColorTarget` instead.
+- HDR: the trace can't decode FP16 bands; HUD-less in HDR assumes `copyWithGamma` is the identity for
+  scRGB as well (measured equal outside the HUD, 6).
 - Stereo + FG: not combined (stereo stays off with `[fg] enabled`). The HUD-less vtable patch chains
   into stereo's detour if both ever run.
 
-## Resume notes (2026-11-22, session stopped for a laptop reboot)
+## Resume notes (2026-11-23, branch `wip/fg-pacing`)
 
-**State.** Everything above is implemented in `src/features/fg/` and builds clean (`cmake --build
-build-fg`; nothing committed). Measured on the laptop (runs r5/r6 of the old local `control-fg`):
-1 (baseline), 2 (camera), 3 (HUD-less). **Not measured:** 4 (`pace = smooth` vs `ready`) and 5
-(`count = auto`, never run live). Traces so far: `build-fg/fgtrace/` (local, gitignored; rows via
-`python3 -I tools/fg/fg-table.py build-fg/fgtrace/<dirs>`). Last usable numbers: capped `ready` 4x
-at 30 fps (s3-i4, r5): G→G 8.39 ± 0.10 ms, G→R 8.41 ± 0.11, R→G 8.05 ± 2.56, residual 3.28 / 6.49 px;
-uncapped `ready` 4x (s1-base-4x): interval sd 2.67 ms, residual 9.45 / 18.97 px.
+**State.** Measured: 1 (baseline), 2 (camera), 3 (HUD-less) on the laptop; 5 (`count = auto`
+behaviour) and 6 (HDR) on rayblaster. **Still to measure: 4, the `smooth` / `ready` pacing A/B**, which
+needs rayblaster without lab limits (`quiver --machine rayblaster lab status control-fg` must not say
+`THROTTLED`; the user's play throttles lab GPU use to 20 %) and the GPU lock. `pace = smooth` is this
+branch's default (main: `ready`); merge it only if 4 shows it better.
 
-**Lab now runs on rayblaster** (CLAUDE.md). Instance `control-fg` exists there (1920x1080@165 for
-the refresh target; created, `game-start` fixture installed, saves made writable); it is **down**
-and has not run yet. Its `install/renderer.ini` already has the test settings (output 1920x1080,
-render 1280x720 = DLSS Quality, `m_eDLSSQuality` 1, RT off, motion blur and film grain off,
-`m_bSkipIntroVideos` true), copied from the laptop instance. `tools/fg/launch` (new: fixture,
-menus, `skip`, wait for camera control) and `tools/fg/*` were synced to `rayblaster:threshold-lab/
-tools/fg/`; the mod copy is `rayblaster:threshold-lab/mod-fg` (fg.enabled=1, defaults otherwise).
-
-**Next, in order** (every trace under the GPU lock; note `quiver lab host` next to the numbers):
+Instance `control-fg` on rayblaster: 1920x1080@165, currently **HDR** (`display.hdr=on`,
+renderer.ini `m_eAllowHDR 1`; otherwise DLSS Quality 1280x720, RT off, motion blur / film grain off,
+intro skip). The trace bands need SDR: switch back first.
 
 ```sh
-export QUIVER_SOURCE=agent:threshold-fg QUIVER_LAB_OWNER=claude:threshold-fg
-cmake --build build-fg && tools/fg/moddir /tmp/mod-fg fg.enabled=1
-rsync -a --delete /tmp/mod-fg/ rayblaster:threshold-lab/mod-fg/ && rsync -a tools/fg/ rayblaster:threshold-lab/tools/fg/
-quiver --machine rayblaster lab up control-fg
-tools/lab/rb tools/fg/launch control-fg /home/ajg/threshold-lab/mod-fg
-# 4. pacing A/B, 2x and 4x, capped and uncapped (fg-series sets [fg] keys live, traces under quiver lab gpu)
+cd ~/code/threshold-wt/fg && scripts/build
+export QUIVER_SOURCE=agent:threshold-fg QUIVER_LAB_OWNER=claude:threshold-fg Q="quiver --machine rayblaster"
+$Q lab edit control-fg display.hdr=off && $Q lab down control-fg && $Q lab up control-fg
+ssh rayblaster "python3 -c \"import json;p='/home/ajg/Games/quiver-lab/instances/control-fg/install/renderer.ini';d=json.load(open(p));d['m_eAllowHDR']=0;json.dump(d,open(p,'w'),indent=1)\""
+$Q lab status control-fg | grep -i throttl          # must print nothing
+tools/fg/moddir /tmp/mod-fg fg.enabled=1
+tools/fg/launch control-fg /tmp/mod-fg              # Q set: drives rayblaster, uploads the mod
+rsync -a tools/fg/ rayblaster:threshold-lab/tools/fg/
+# fg-trace/fg-series run where the instance is (they read its run folder and spin via `quiver lab exec`):
 tools/lab/rb tools/fg/fg-series control-fg p2 "r2|pace=ready count=2 fps_limit=0" "s2|pace=smooth" \
   "r4|pace=ready count=4" "s4|pace=smooth" "r4b|pace=ready" "s4b|pace=smooth" \
-  "r4c|pace=ready fps_limit=40" "s4c|pace=smooth" "r2c|pace=ready count=2 fps_limit=60" "s2c|pace=smooth"
-# 5. count=auto against the 165 Hz display (expect "fg: display refresh 165 Hz", then "fg: count auto ..." lines)
-tools/lab/rb tools/fg/fg-series control-fg a1 "auto|count=auto fps_limit=0 pace=smooth" "auto240|target_hz=240"
-tools/lab/rb sh -c 'grep -E "display refresh|count auto" $(ls -1td ~/Games/quiver-lab/instances/control-fg/lab/runs/* | head -1)/threshold.log'
+  "r4c|pace=ready fps_limit=40" "s4c|pace=smooth" "r2c|pace=ready count=2 fps_limit=80" "s2c|pace=smooth"
 rsync -a rayblaster:threshold-lab/build-fg/fgtrace/ build-fg/fgtrace/
-python3 -I tools/fg/fg-table.py build-fg/fgtrace/p2-* build-fg/fgtrace/a1-*
-quiver --machine rayblaster lab down control-fg
+python3 -I tools/fg/fg-table.py build-fg/fgtrace/p2-*
+$Q lab down control-fg
 ```
 
-`tools/fg/fg-trace` runs on the machine that hosts the instance (it reads
-`~/Games/quiver-lab/instances/<i>/lab/runs/` and uses `quiver lab exec` for the spin), hence
-`tools/lab/rb`. Then: fill sections 4 and 5 above with the rows; decide whether the headroom cap
-(Pharos `auto_cap`) is needed: if uncapped `smooth` still shows "game waited" in the perf line and DLSS-G
-done > 0.7 of the interval, add it in `limit()`/`auto_step()` in `fg.cpp`. After that, HDR input (PQ
-conversion for an scRGB swapchain, Pharos `src/fg/color.cpp`).
+Then fill section 4. If uncapped `smooth` still shows "game waited" in the perf lines with DLSS-G done
+> 0.7 of the interval, add Pharos's headroom cap (`auto_cap`) in `limit()` / `auto_step()` in
+`fg.cpp`.
