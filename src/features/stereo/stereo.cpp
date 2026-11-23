@@ -20,6 +20,7 @@
 #include <dxgi.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -484,17 +485,20 @@ UseJp_t o_useJp;
 Reload_t o_reload;
 std::atomic<void*> g_lc_jp{nullptr};
 std::atomic<uint64_t> g_lc_reload_tick{0}, g_lc_tail_until{0};
+std::atomic<uint64_t> g_lc_begin{0};  // when the current level change began (0: none)
 std::atomic<bool> g_load_mono{true};
 std::atomic<uint64_t> g_n_load_mono{0}, g_n_level_changes{0};
 uintptr_t g_onIsLoading = 0;
 void __fastcall hk_useJp(void* jp, bool reload, bool debug) {
   g_lc_jp = jp;
+  if (!g_lc_begin.load()) g_lc_begin = GetTickCount64();
   g_lc_tail_until = GetTickCount64() + 2000;
   g_n_level_changes++;
   o_useJp(jp, reload, debug);
 }
 void __fastcall hk_reload(void* ses, const void* jp, bool flag) {
   g_lc_reload_tick = GetTickCount64();
+  if (!g_lc_begin.load()) g_lc_begin = GetTickCount64();
   g_lc_tail_until = GetTickCount64() + 5000;
   g_n_level_changes++;
   o_reload(ses, jp, flag);
@@ -515,6 +519,26 @@ bool engine_loading() {
     return false;
   return reinterpret_cast<bool (*)(void*)>(vt[2])(impl);
 }
+// Streaming activity: the RT acceleration-structure job (renderer+0xa89c0, once per world render)
+// builds a BLAS for every object that came in since the last one (lists at scene+0x40/+0x50, counts
+// +0x48/+0x58; static, docs/stereo.md). Observed only (pass-through), on the job's worker thread.
+using AsJob_t = void(__fastcall*)(void** cap);
+AsJob_t o_asJob;
+std::atomic<uint64_t> g_last_blas_tick{0}, g_n_blas_builds{0};
+void __fastcall hk_asJob(void** cap) {
+  if (cap && *cap) {
+    auto* sc = static_cast<uint8_t*>(*cap);
+    uint32_t n = *reinterpret_cast<uint32_t*>(sc + 0x48) + *reinterpret_cast<uint32_t*>(sc + 0x58);
+    if (n) {
+      g_last_blas_tick = GetTickCount64();
+      g_n_blas_builds += n;
+    }
+  }
+  o_asJob(cap);
+}
+// A level change keeps the frame mono until the engine is done (signals above) and then until no
+// new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
+constexpr uint64_t kSettleMs = 3000, kChangeMaxMs = 90000;
 bool level_changing() {
   if (!g_load_mono.load()) return false;
   uint64_t now = GetTickCount64();
@@ -531,10 +555,22 @@ bool level_changing() {
     g_lc_reload_tick = 0;
   }
   if (busy) {
-    g_lc_tail_until = now + 2000;
+    if (!g_lc_begin.load()) g_lc_begin = now;
+    g_lc_tail_until = now + kSettleMs;
     return true;
   }
-  return now < g_lc_tail_until.load();
+  uint64_t b = g_lc_begin.load();
+  if (!b) return false;
+  if (now - b > kChangeMaxMs) {  // never settled: give up waiting
+    g_lc_begin = 0;
+    return false;
+  }
+  uint64_t quiet_from = std::max(g_lc_tail_until.load(), g_last_blas_tick.load() + kSettleMs);
+  if (now < quiet_from) return true;
+  TH_LOG("stereo: level change settled after %.1f s (BLAS builds so far %llu): 3D again", (now - b) / 1000.0,
+         (unsigned long long)g_n_blas_builds.load());
+  g_lc_begin = 0;
+  return false;
 }
 void level_hooks_start() {
   const Image& exe = game_image();
@@ -549,6 +585,9 @@ void level_hooks_start() {
                                "stereo");
       rl && sig_match(rl, "40 57 48 81 ec f0 00 00 00 48 c7 44 24 28 fe ff"))
     hook_fn(rl, (void*)hk_reload, (void**)&o_reload, "startReloadingEpisodeFromJumpPoint (stereo)");
+  void* aj = reinterpret_cast<void*>(g_rimg.at(0xa89c0));
+  if (sig_match(aj, "40 55 56 41 57 48 83 ec 50 48 8b f1 33 ed 8b cd 38 0d ?? ?? ?? ?? 0f 95"))
+    hook_fn(aj, (void*)hk_asJob, (void**)&o_asJob, "RT acceleration-structure job (stereo: streaming activity)");
   g_onIsLoading = reinterpret_cast<uintptr_t>(
       module_export(kCore, "?onIsLoading@coregame@@3V?$function@$$A6A_NXZ@std@@A", "stereo"));
 }
@@ -944,7 +983,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -952,7 +991,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());

@@ -25,4 +25,9 @@ for loc in mail-room executive-corridor cafeteria motel dead-letters entry-lobby
   r=$(q teleport $i $loc --timeout 150 2>&1 | tail -1 | cut -c1-60)
   echo "$loc: $r | $(st)"; echo "$r" | grep -q Error && break
 done
-ssh -o BatchMode=yes rayblaster 'L=$(ls -dt ~/Games/quiver-lab/instances/control-stereo/lab/runs/r* | head -1); echo run $L; echo signaller $(grep -c signaller $L/game.log); grep "RT async\|stall: no" $L/threshold.log | head -4'
+if ! tail -1 <<<"$r" | grep -q Error; then   # then a checkpoint restart, and 40 s of play after it
+  q call $i restart >/dev/null 2>&1; q wait $i in-world --timeout 240 >/dev/null 2>&1
+  for n in $(seq 1 8); do q wait $i frame --timeout 6 >/dev/null 2>&1; q shot $i /dev/null --settle 4 >/dev/null 2>&1; done
+  a=$(st); q wait $i frame --timeout 6 >/dev/null 2>&1; q shot $i /dev/null --settle 4 >/dev/null 2>&1; echo "restart: $a -> $(st)"
+fi
+ssh -o BatchMode=yes rayblaster 'L=$(ls -dt ~/Games/quiver-lab/instances/control-stereo/lab/runs/r* | head -1); echo run $L; echo signaller $(grep -c signaller $L/game.log); grep "RT async\|stall: no" $L/threshold.log | head -4; journalctl -k --since "-25min" | grep "Xid.*Control" | tail -2'
