@@ -183,33 +183,40 @@ expected); with HUD-less they are as tight as elsewhere. HUD elements that move 
 reticle, damage numbers, objective text over a moving scene) are where ghosting would show; not
 measured separately.
 
-### 4. Pacing (`pace = smooth`)
+### 4. Pacing (`pace = smooth`, rayblaster r6)
 
-**Implemented, not measured cleanly.** `pace = smooth` (default) is Pharos's: the first generated
-frame is held until one step after the previous real frame's Present *call*, minus `pace_relax` (0.5)
-of how early DLSS-G finished relative to that; every later present one step after the previous
-Present's call (not its return). The interval average excludes the renderer thread's waits for the
-present thread (Pharos's neutral loop) and caps hitches at 2.5x; a frame without generation restarts
-it. It ran in r6 (no failures, no drops), but every trace of that session (`p1-*`) was taken with
-three Control instances on the GPU at 7–13 real fps (DLSS-G done 120–230 ms after the game's
-Present), and the host's NVIDIA driver then wedged (NVRM `dmaAllocMapping_GM107: can't update VA
-space` at 18:29, `nvidia-smi` stuck), so the A/B could not be retaken.
+`pace = smooth` (Pharos's): the first generated frame is held until one step after the previous real
+frame's Present *call*, minus `pace_relax` (0.5) of how early DLSS-G finished relative to that; every
+later present one step after the previous Present's call (not its return). The interval average
+excludes the renderer thread's waits for the present thread and caps hitches at 2.5x.
 
-What the v1 (`ready`) traces show and `smooth` targets:
+A/B in one session (`control-fg` on rayblaster, RTX 5090, SDR 1920x1080@165, DLSS Quality, RT off;
+`PRESENTS=960 SHOTS=360 tools/fg/fg-series ...`), each trace under `quiver lab gpu` (other lab
+instances throttled). No lab limits in force (user not playing). Host during the valid rows:
+`aw2-crash` (Alan Wake 2, another session) and `control-stereo` were GPU users and the GPU read
+91–98 % busy, except s4cb / r2c / s2c (15–21 %, `aw2-crash` idle or gone). Interval sd: all
+present-call intervals (G→G / G→R / R→G); residual: |position residual| mean / p90, VRR model.
 
-- Uncapped 4x (`s1-base-4x`, above): bursts, R→G 0.18 ms, G→G 2.4 / 9.2 ms, interval sd 2.67 ms,
-  residual 9.45 / 18.97 px against 4.92 / 9.76 at 2x.
-- Capped (`fps_limit`, r5, `ready`): the limiter holds the rate exactly (40.0 / 30.0 real fps, game
-  waited 0 times) and every transition except the first generated frame is even: 2x G→R 12.56 ±
-  0.09 ms but R→G 12.40 ± **1.51**; 4x G→G 8.39 ± 0.10, G→R 8.41 ± 0.11, R→G 8.05 ± **2.56** (p1 1.0,
-  p99 14.4 ms). That R→G spread is the "first generated frame as soon as DLSS-G is done" rule;
-  `smooth` replaces it with a target one step after the real frame's call. Pharos measured the same
-  change at 0.46 vs 2.2–2.5 ms interval sd and residual 6.7 vs 9.8 px.
-- Pharos's `pace = smooth` reference: present-interval sd 0.28–0.46 ms, VRR residual 1.7–4.2 px
-  mean. Threshold capped `ready`: sd 0.93–1.64 ms, residual 3.3–5.0 px mean (rows s3-* above).
+| pair | config | real fps | game waited /2 s | interval sd ms, ready → smooth | residual px, ready → smooth | shift ratio |
+|---|---|---|---|---|---|---|
+| r2 / s2 | 2x uncapped | 146 / 145 | 0 / 0 | 1.34 (R→G 1.85) → **0.87** (R→G 1.20) | 5.20 / 10.2 → **3.92 / 7.45** | 0.50 both, 0 / 1 of 358 outside |
+| r4 / s4 | 4x uncapped | 116 / 118 | 100 / 126 | 1.47 (G→G 1.20) → **0.76** (G→G 0.32) | 4.32 / 9.33 → **3.22 / 6.81** | k/4 ± 0.003 both, 0 outside |
+| r4b / s4b | 4x uncapped | 85 / 86 | 122 / 153 | 2.10 (G→G 1.98) → **1.21** (0.92) | 7.55 / 14.9 → **4.67 / 9.53** | same |
+| r4c / s4c | 4x, fps_limit 40 | 40.0 / 40.0 | 0 / 0 | 1.13 (R→G 2.25) → **0.78** (1.54) | 3.33 / 7.79 → **2.52 / 5.65** | same |
+| r4cb / s4cb | 4x, fps_limit 40 | 39.5 / 40.0 | 0 / 0 | 1.15 (R→G 2.29) → **0.52** (1.01) | 3.29 / 7.24 → **1.80 / 3.59** | same |
+| r2c / s2c | 2x, fps_limit 80 | 80.0 / 79.5 | 0 / 0 | 1.06 (R→G 1.49) → **0.77** (1.08) | 4.41 / 8.84 → **2.56 / 5.13** | same |
 
-Retake: `tools/fg/fg-series control-fg p2 "r4|pace=ready count=4 fps_limit=30" "s4|pace=smooth"
-"r4b|pace=ready" "s4b|pace=smooth" "r4u|pace=ready fps_limit=0" "s4u|pace=smooth"` on an idle GPU.
+Not used: r2b / s2b and r2cb / s2cb (the last four traces), taken after a host game and
+`awr-bridge` started: VRAM 32.1 of 32.6 GB, real fps 39–62 and swinging, 17–105 waits.
+
+Result: **`smooth` is better in all six valid pairs**: present-interval sd 30–55 % lower, position
+residual 25–45 % lower, interpolation unchanged (shift ratios identical). The remaining spread is the
+first generated frame after a real one (R→G), as in Pharos (their sd 0.28–0.46 ms; ours 0.52–1.21).
+Uncapped at 4x the game waits for the present thread 100–150 times per 2 s with either pacing
+(DLSS-G done 9–15 ms after the game's Present against an 8.5–12 ms interval), slightly more with
+`smooth` (it holds frames): that is the case for Pharos's headroom cap (`auto_cap`), still open; a
+`fps_limit` (or `count = auto`'s refresh cap) removes the waits entirely (0 in every capped row).
+Latency was not measured.
 
 ### 5. `count = auto` (live, rayblaster r2–r4, behaviour only)
 
@@ -309,11 +316,10 @@ installed with `enabled = 1`.
 
 ## Resume notes (2026-11-23, branch `wip/fg-pacing`)
 
-**State.** Measured: 1 (baseline), 2 (camera), 3 (HUD-less) on the laptop; 5 (`count = auto`
-behaviour) and 6 (HDR) on rayblaster. **Still to measure: 4, the `smooth` / `ready` pacing A/B**, which
-needs rayblaster without lab limits (`quiver --machine rayblaster lab status control-fg` must not say
-`THROTTLED`; the user's play throttles lab GPU use to 20 %) and the GPU lock. `pace = smooth` is this
-branch's default (main: `ready`); merge it only if 4 shows it better.
+**State.** All measured: 1–3 on the laptop; 4 (pacing A/B: `smooth` better in every valid pair), 5
+(`count = auto` behaviour) and 6 (HDR) on rayblaster. Next: Pharos's headroom cap for uncapped
+play (4: the game waits for the present thread at 4x uncapped), and latency (`smooth` vs `ready`).
+The commands below retake 4.
 
 Instance `control-fg` on rayblaster: 1920x1080@165, currently **HDR** (`display.hdr=on`,
 renderer.ini `m_eAllowHDR 1`; otherwise DLSS Quality 1280x720, RT off, motion blur / film grain off,
