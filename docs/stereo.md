@@ -3,7 +3,7 @@
 > **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r45, RT reflections):
 > the right eye's acceleration-structure job now runs the BLAS builds that only it has
 > (`as_once = 5`), and the frame is mono during level changes until streaming settles
-> (`load_mono = 1`, ~30-40 s after a teleport). See "Level-change hang". All
+> (`load_mono = 1`: the loading screen plus ~3 s, up to 25 s or more in busy areas). See "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
 > both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
 > per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
@@ -553,7 +553,7 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
   per-job build counts through a tail (no risk: `load_mono` stays on) to tell a decaying load burst
   from that area's steady rate, then make the threshold follow the new area's rate.
 - **Why the right eye's new BLAS builds hang during a level change** (Xid 109, r41/r42) is not
-  known; `load_mono` keeps those frames mono instead (2D for ~30-40 s after each teleport). Suspect:
+  known; `load_mono` keeps those frames mono instead (2D through the load and ~3-25+ s after it). Suspect:
   BLAS storage is allocated on worker jobs ("rtd:Threaded resource allocation", static
   renderer+0x151570 `RaytracingStaticMeshStorage`) and an entry that enters the lists between the
   eyes may be built before its allocation has finished. `mode = left` faulted once in r33 (one
@@ -630,7 +630,7 @@ entries (pointers). The right eye's job skips those and runs the build entries t
 again next update. Running the right eye's new builds hangs during a level change (r41 with bit 8,
 r42 without: `Xid 109` within seconds of the first teleport, after 14 and 10 min without a fault in
 the world), so the frame stays mono while the engine changes level and until BLAS-build bursts settle
-(`load_mono`, ~30-40 s after a teleport, r43).
+(`load_mono`: ~3 s after the loading screen in some areas, 25+ s in busier ones; r43, r45, r47).
 
 | run | settings (sbs, RT reflections only) | result |
 |---|---|---|

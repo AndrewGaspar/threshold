@@ -23,9 +23,9 @@ Remastered, the same engine family) and Pharos (Assassin's Creed Origins).
   side (full or half SBS, automatic on a HypXRland stereo output). Temporal state is kept per eye
   (DLSS, TAA, motion, RT denoisers), with separation, convergence and eye swap. See
   [`docs/stereo.md`](docs/stereo.md). Frame generation works in 3D too: one DLSS-G feature per eye,
-  each with its own eye's depth, motion vectors and camera. With ray tracing, 3D is verified with RT reflections
-  (the other RT effects aren't tested in 3D yet), and the image stays 2D for ~30-40 s after a level
-  change while geometry streams in.
+  each with its own eye's depth, motion vectors and camera. With ray tracing, 3D is verified with all RT effects on,
+  with and without frame generation; the image stays 2D through a level change's loading screen and
+  for ~3 s to 25+ s after it (longer in busy areas) while geometry streams in.
 - **Current DLSS models**: ships DLSS 310.9.16, so Quiver's *DLSS Super Resolution model* tweak can
   select the DLSS 4.5 presets M/L. It also turns off the game's default legacy (CNN) model.
 - **Ray Reconstruction crash fix**: the game's RR path passes no inputs. Under Proton the driver's
