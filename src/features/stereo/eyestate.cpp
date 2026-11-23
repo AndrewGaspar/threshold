@@ -265,8 +265,10 @@ struct RightSet {
 RightSet g_rs, g_ls;  // the right eye's set; the engine's (left) values while the right one is in
 bool g_rs_in = false;
 std::atomic<int> g_hist_per_eye{1};  // stereo.history_per_eye (part of per_eye; a separate control)
-// stereo.history_mask (debug): 1 graph persisted, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring
-std::atomic<int> g_hist_mask{30};  // graph list (1) shared by default: docs/stereo.md, "Render-graph history"
+// stereo.history_mask (debug): 1 graph persisted, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring,
+// 32 the RT reflection filter's output history (with 2). All per eye by default: measured best
+// (docs/stereo.md, "Render-graph history", rayblaster r38).
+std::atomic<int> g_hist_mask{63};
 int g_mask_now = 0;  // the mask the current swap used (leave undoes exactly that)
 std::atomic<uint64_t> g_n_hist_swaps{0}, g_n_graph_flush{0};
 void* rt_manager() { return *reinterpret_cast<void**>(g_rimg.at(kRvaRtManager)); }
@@ -488,7 +490,7 @@ void eyestate_register() {
     g_hist_per_eye = (v == "0" || v == "false" || v == "off") ? 0 : 1;
   });
   cfg_listen("stereo.history_mask", [](const std::string&, const std::string& v) {
-    g_hist_mask = v.empty() ? 30 : atoi(v.c_str());
+    g_hist_mask = v.empty() ? 63 : atoi(v.c_str());
   });
   cfg_listen("stereo.graph_cross", [](const std::string&, const std::string& v) { g_graph_cross = atoi(v.c_str()); });
   cfg_listen("stereo.dlss_per_eye", [](const std::string&, const std::string& v) {

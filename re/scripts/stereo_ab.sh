@@ -13,7 +13,7 @@ mkdir -p "$out"
 export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-stereo}
 Q=(quiver); [ -n "${RB:-}" ] && Q=(quiver --machine "$RB")
 quiver() { command "${Q[@]}" "$@"; }
-base="mode=sbs separation=32.5 convergence=0 per_eye=1 dlss_per_eye=1 history_mask=30 graph_cross=0"
+base="mode=sbs separation=32.5 convergence=0 per_eye=1 dlss_per_eye=1 history_mask=63 graph_cross=0"
 set_() { quiver lab set "$inst" $(for kv in "$@"; do echo "install:threshold.ini:[stereo]$kv"; done) --wait >/dev/null 2>&1
          quiver lab shot "$inst" /dev/null --settle 3 >/dev/null 2>&1; }
 cap() {

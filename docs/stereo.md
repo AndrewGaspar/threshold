@@ -1,9 +1,10 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Status:** the level-change GPU fault is fixed (`as_once`: the
-> right eye no longer re-runs the engine's BLAS build/compaction lists; rayblaster r18, HDR, 6 teleports
-> plus a checkpoint restart with 3D on throughout). The HDR HUD is in both eyes by default
-> (`hdr_hud_wide`). See "Level-change hang".
+> **Status:** the level-change double BLAS build/compaction is fixed (`as_once`; rayblaster r18/r19).
+> **Open:** with ray tracing on, 3D play (sbs, and even `mode = left`) still faults the GPU after
+> seconds to minutes in the world (rayblaster r20-r37; mono passes): see "Level-change hang". All
+> temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
+> both eyes by default (`hdr_hud_wide`).
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -34,7 +35,7 @@ left, right eye right, the HUD hint in both halves.*
 | Output `full` / `sbs` (2W swapchain, eyes 1:1) and `hsbs` (W swapchain, eyes squeezed 2:1) | done | live captures |
 | HUD in both halves from one UI paint | done | live captures |
 | Per-eye: previous camera, object motion, DLSS feature (and its reset), RT denoiser histories, SSR/AO/sun-shadow ping-pongs, volumetric light, TAA ring | done | measured (DLSS on r10; TAA ring with DLSS off r23) |
-| Render-graph persisted resources (`lastcolorbuffer`, `previouslineardepth`) | shared on purpose (per eye available, `history_mask = 31`) | measured r20/r21: per eye is worse, see "Render-graph history" |
+| Render-graph persisted resources (`lastcolorbuffer`, `previouslineardepth`) | per eye (with the RT reflection filter's output history, `history_mask = 63`) | measured r38: best of shared / per eye in the ghost zones, whole frame and disparity, see "Render-graph history" |
 | TAA without DLSS (`m_eDLSSQuality: 0`) | done | measured r23 |
 | `output = full` on a plain 2W-wide desktop: window widened, mouse per eye | done (borderless, windowed) | live, 3840x1080 lab display |
 | HDR (FP16 scRGB swapchain): both eyes composed | done | live r24 (1046 pairs) |
@@ -139,11 +140,11 @@ The left eye uses the engine's own state, the right eye a second set swapped in 
 | previous camera (camera motion vectors, `g_m*Previous*`) | main `rend::View` +0x3d0/+0x450/+0x4b0 | each eye's current matrices kept after its render and put back before its next one (static: `storePrevious` 0x180700 from `end`) |
 | object previous transforms (object motion vectors) | Cleanup pass copies Object +0x70 → +0xa0 only when the high-res-screenshot tile index == count (`renderer+0x802978/7c`) | the left eye renders as a non-final tile (count = index + 1): both eyes see last update's transforms; the right eye advances them. The ambient probe, guarded the same way, updates once (right eye) |
 | DLSS history | `DLSSData+0x28/+0x30` (d3d `0x111be0`) | a second NGX feature created from the engine's own create parameters (sizes, quality, flags, preset hints) through the game's exported NGX entry points, swapped in for the right eye; re-created when the engine's feature changes, released 3 presents after its last use |
-| RT denoiser (DLF) histories | 4 globals `renderer+0x90eac8, 0x912b18, 0x910b98, 0x90eb98` | pointer swap (the filters allocate on null; static) |
+| RT denoiser (DLF) histories | 4 globals `renderer+0x90eac8, 0x912b18, 0x910b98, 0x90eb98`, and the reflection filter's output history `0x912b20` (bit 32, paired with `0x912b18`) | pointer swap (the filters allocate on null; static) |
 | SSR / AO / sun-shadow temporal | `rend::SSAO` (r+0xd8) ping-pong pairs +0x100..+0x138 | pointer swap; its prepare allocates the right eye's |
 | volumetric light | r+0xe8: +0x18 history, +0x40..+0x70 remembered camera | swap (history null falls back to the current buffer) |
 | TAA ring (DLSS off) | SSAA r+0x138, 3 slots of {view, texture} | block swap; the right ring starts as a copy with no textures (the resolve allocates them) |
-| render-graph persisted resources | vector `renderer+0x910c20` | **shared by default** (`history_mask` bit 1 swaps the whole list per eye; measured worse, "Render-graph history") |
+| render-graph persisted resources | vector `renderer+0x910c20` | the whole list swapped per eye (`history_mask` bit 1; measured best with bit 32, "Render-graph history") |
 
 Measured (r10, 32.5 mm, parallel; reference = the mono-frame `left`/`right` pair of the same run,
 per-patch disparity of each capture's halves vs the reference's):
@@ -209,36 +210,44 @@ on live in the world (r18), and r9's exact bisect sequence replayed (`history_ma
 16, 0, 1, 31; r19) all render both eyes. r9's build is gone; whatever made it black is not in the
 current code.
 
-**Per eye is measurably worse, so the list stays shared.** Method: photo mode (pause menu → Photo
-Mode, `t` hides its UI) freezes the world while it keeps rendering, so captures and the mono-frame
-references show the same instant (no idle animation between them). Lobby, 32.5 mm, parallel, DLSS
-DLAA, 2 captures per variant (r20). `graph_cross` (dev) keeps per-eye lists but copies one entry's
-content from the other eye's latest, to bisect which entry matters:
+**The ghost's partner: the RT reflection filter's second history (bit 32). Everything per eye is
+now the default (`history_mask = 63`).** `rend::DeferredLightFiltering::filterSpecularNoise`
+(renderer+0x15bd0, static) keeps two textures named `m_pColorHistory`: the input history
+`g_DLF_tInputHistory` (0x912b18, swapped per eye before) and the output history
+`g_DLF_tOutputHistory` (0x912b20, was not). It reprojects the reflection history with the previous
+linear depth. With per-eye depth (bit 1) and a shared output history, each eye reprojected the
+*other* eye's reflections with its own depth: the ghost of the other eye's Jesse. The filter treats
+the pair as one: a non-null input history means "both exist" (a null output history then crashed,
+live r32), and a null one makes it allocate both and free the current output history. So bit 32
+swaps 0x912b20 only together with bit 2, and a new right-eye output history restarts the input one.
+
+Measured (rayblaster r38, SDR, lobby photo mode, 32.5 mm, parallel, DLSS DLAA; mean |diff| to the
+mono-frame reference /255, two captures per variant; two rounds, the second in reverse order; ghost
+zones from the per-eye-graph-minus-shared difference as before, ~8% of each eye):
+
+| variant | ghost zones L / R | whole frame L / R | disparity vs reference, mean \|diff\| |
+|---|---|---|---|
+| `30`: graph list and reflection output history shared (old default) | 3.05 / 3.13, 2.97 / 3.10 | 1.510 / 1.531, 1.496 / 1.526 | 1.85-1.89, 1.71-1.79 px |
+| `31`: graph list per eye, output history shared | 3.43 / 3.47, 3.35 / 3.40 | 1.526 / 1.536, 1.518 / 1.534 | 1.79-1.94 px |
+| `62`: graph list shared, output history per eye | 2.12 / 2.26, 2.03 / 2.19 | 1.377 / 1.407, 1.362 / 1.397 | 1.14-1.17, 1.20-1.23 px |
+| **`63`: everything per eye (new default)** | **1.95 / 1.99, 1.88 / 1.94** | **1.346 / 1.353, 1.336 / 1.348** | **1.00-1.20, 1.17 px** |
+
+So the shared output history was most of the error (30 → 62: −32% in the ghost zones, −10% over the
+whole frame, −37% disparity error), and with it per eye the per-eye graph list now helps instead of
+ghosting (62 → 63). Script: `RB=rayblaster re/scripts/stereo_ab.sh control-stereo OUT -n 2 m30:history_mask=30 ...`
+after `re/scripts/stereo_rb_photo.sh` (driven in `mode = off`, then switched live).
+
+Before that (r20, laptop), with the output history still shared, per-eye lists measured worse than
+shared, and crossing only the depth (`graph_cross = 1`) removed the ghost:
 
 | variant | ghost zones L / R (mean \|diff\| to the mono reference, /255) | whole frame L / R | disparity vs reference: median / mean \|diff\| |
 |---|---|---|---|
-| shared list (`history_mask = 30`, default) | **1.13 / 1.23** | 1.576 / 1.603 | **−0.036 / 2.44 px** |
+| shared list (`history_mask = 30`) | 1.13 / 1.23 | 1.576 / 1.603 | −0.036 / 2.44 px |
 | per-eye lists (`31`) | 1.57 / 2.02 | 1.619 / 1.616 | −0.060 / 2.72 px |
 | per-eye, depth content crossed (`31`, `graph_cross = 1`) | 1.15 / 1.23 | 1.577 / 1.600 | −0.038 / 2.49 px |
 | per-eye, colour content crossed (`graph_cross = 2`) | 1.54 / 1.97 | 1.594 / 1.602 | |
 | per-eye, both crossed (`graph_cross = 3`) | 1.12 / 1.23 | 1.576 / 1.600 | −0.037 / 2.44 px |
 | everything shared (`per_eye = 0`) | 2.00 / 1.77 | 3.468 / 3.858 | |
-
-With per-eye lists each eye shows a faint silhouette of the *other* eye's Jesse on the floor beside
-her (left eye on her left, right eye on her right; the "ghost zones" are where it is, found from the
-difference of the two variants). It comes from `previouslineardepth`: crossing only the depth removes
-it, crossing only the colour does not. So some consumer of the previous linear depth pairs it with
-state that is still "the last render's" (i.e. the other eye's). Shared, that state and the shared
-depth agree. Bisecting the other per-eye sets with the depth per eye (`history_mask` 23, 27, 29, 15:
-volumetric, SSAO pairs, DLF, TAA ring shared in turn) did not remove the ghost, so the partner is
-outside every set swapped today (candidates read statically: the view-volume (froxel) lighting
-history `renderer+0x191de0` object +0x20/+0x28, which is reprojected with the per-eye camera but not
-swapped; the RT pass's other temporal inputs). Per-eye `lastcolorbuffer` alone (`graph_cross = 1`)
-gave no measurable change against shared anywhere in the lobby: whole frame, ghost zones, disparity,
-and the reflective floor at the screen edges (240 px strips, y > 640, L / R: right edge 3.032 / 3.027
-with per-eye colour, 3.024 / 3.023 shared, 3.056 / 3.023 all per eye; left edge 1.435 / 1.432,
-1.426 / 1.414, 1.453 / 1.430), so it is not worth two extra copies per frame. The corridor with stronger
-reflections was not measured (the teleport there hung, open issues).
 
 Earlier lobby captures with the player idling (r18, not frozen): per-eye vs shared, reflective floor
 regions away from the player within ±0.1/255 of each other, disparity vs reference 3.67-3.80 vs
@@ -365,9 +374,9 @@ Not implemented: FG is not settled, and (a)-(c) mean two features and two input 
 | `hyprland_tag` | 1 | tag the window `stereo-sbs` / `stereo-hsbs` over Hyprland's IPC |
 | `per_eye` | 1 | per-eye temporal state (0 = shared, for comparison) |
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
-| dev: `history_mask` | 30 | 1 graph persisted list (off by default: measured worse), 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring |
+| dev: `history_mask` | 63 | per-eye sets: 1 graph persisted list, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring, 32 the RT reflection filter's output history (only with 2). All on: measured best (r38) |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
-| dev: `as_once` | 1 | the right eye skips the engine's BLAS build/compaction lists (the level-change fault fix); 0 runs them twice |
+| dev: `as_once` | 1 | mask: 1 the right eye's AS job skips the engine's BLAS build/compaction lists (the level-change fault fix), 2 also its dynamic-BLAS refit list; 0 runs them twice. The right eye's job is the pair's second, by order (the job runs on a worker thread) |
 | dev: `load_mono` | 0 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading): avoids the level-change GPU fault |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
@@ -381,10 +390,8 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 
 ## Open issues
 
-- **Level change hangs in sbs**: see "Level-change hang: analysis so far" below.
-- **Cross-eye ghost with per-eye `previouslineardepth`**: some consumer pairs it with state that is
-  still per render; not identified (froxel lighting history the main candidate). It is why the
-  graph list stays shared ("Render-graph history").
+- **GPU fault in 3D play with ray tracing** (MMU fault, one shader, minutes into play; mono is fine):
+  see "Level-change hang" for the bisect so far. Workaround: RT off in 3D.
 - **HDR HUD brightness / paper white** were not compared to mono (only presence in both eyes).
 - **Exclusive fullscreen with `output = full`** stalls at the title (also without the window code):
   use borderless or windowed.
@@ -395,7 +402,7 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 - No pass-2 shortcuts (shadow maps, probes reused by the second eye): sbs costs a full second
   world render. Same-update vs frame-sequential under a pan (`test_pan`) was not measured.
 
-## Level-change hang (`as_once`; a cinematic transition still hangs)
+## Level-change hang (`as_once`) and the open in-world RT fault
 
 **Cause.** Each world render's "Scene update" launches the ray-tracing acceleration-structure job
 (renderer+0xa89c0). It refits dynamic BLASes, builds BLASes for every object in its build lists
@@ -405,7 +412,8 @@ new BLASes, and above all a second compaction (it frees the source), left GPU wo
 memory. That surfaced as `Xid 13 MMU fault` or `Xid 109` (r8-r16), only when many objects stream in
 at once (a level change) and in the seconds after it, while compactions run.
 
-**Fix (`as_once`, default 1).** The right eye's job runs with those three counts set to 0. It still
+**Fix (`as_once`, default 1).** The right eye's job (the second of the pair, counted when the job
+runs, so a late left-eye job is never taken for the right one) runs with those three counts set to 0. It still
 refits and builds its TLAS from the BLASes the left eye's job built in this update, and the counts are
 put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bisect below, and r18.
 
@@ -418,14 +426,36 @@ put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bi
 - Both eyes are correct afterwards, HUD in both (screenshot).
 Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
 
-**Not fully fixed: a cinematic transition still hangs (rayblaster r20, r21, main's defaults, SDR).**
-Letting the opening cinematic play to its first transition (timeline ends, the next one starts and
-the server session stops ticking for a moment) hung the GPU (r21: `Xid 109` at 03:29:08, presents
-stopped ~0.3 s after the timeline switch at 432.5 s). r20 froze at the same point. r18/r19 skipped
-the cinematic before that transition. So `as_once` removed the double build/compaction, but a hazard
-remains at transitions. Suspect: the right eye's TLAS rebuild (async compute, in place) overlaps the
-left eye's rays still running on d3d's async raytrace queue, with no fence between those two queues.
-Under test: `as_once` + `rt_async_build = 0` (both async paths held off).
+**Open: a GPU fault in ordinary 3D play with ray tracing (rayblaster r20-r37, SDR, main's code).**
+Continue from the game-start fixture, let the opening cinematic play untouched
+(`re/scripts/stereo_rb_cinematic.sh MODDIR`): the player gets control at ~431 s, and in sbs the GPU
+faults some seconds to minutes later. Every fault is the same (`Xid 13`, "SM Warp Exception: MMU
+Fault" on several SMs, class `cec0` = compute, and the same warp ESR address `0x1104_1c813b60` in
+every run, so one particular shader faults on a memory access each time); r21 was `Xid 109`.
+
+| run | settings | result (time after control) |
+|---|---|---|
+| r21 | main defaults (cinematic skipped with space) | fault, ~7 s |
+| r23/r24 | `rt_async_build = 0` (both async RT paths off) | fault, ~138 s |
+| r25 | `video_once = 0` | fault, ~7 s |
+| r26 | `per_eye = 0`, `dlss_per_eye = 0` (nothing swapped) | fault, ~12 s |
+| r27 | `mode = off` (mono, same build) | **no fault** (5 min of control) |
+| r28 | sbs, all RT effects off in renderer.ini | **no fault** (4 min of control) |
+| r29 | sbs, only RT reflections on | fault, ~36 s |
+| r30 | `as_once = 3` (the right eye also skips the dynamic-BLAS refit list) | fault, ~118 s |
+| r31 | AS jobs attributed to eyes by order, not by phase (`as_late` stayed 0) | fault |
+| r33 | `mode = left` (one render per frame, camera moved 16 mm; nothing swapped) | fault, ~11 s |
+| r34 | sbs, `separation = 0` (both eyes the game's own view) | fault, ~181 s |
+| r37 | `mode = off` again (packed `output = full`, as in all runs) | **no fault** (8 min of control) |
+
+So RT is needed (reflections alone suffice), and either a second render per frame (r34, no camera
+change) or a moved camera with one render (r33) triggers it; mono with the same build and output
+passed twice (13 min in all). Nothing swapped per eye is involved (r26, r33), and less right-eye AS
+work (r23, r30) only delays it. Not yet identified. The fixed fault address
+points at one shader reading freed or never-written memory (a BLAS, TLAS instance or shader-table
+record). Teleporting away early (r18/r19) avoided it, which is why the level-change tests passed.
+Workaround until then: RT off in 3D. Dev verb for further bisecting: `stereo tweak <name> <value>`
+(the engine's `d::BaseTweakable::setTweakable`, e.g. the `rtd:` switches).
 
 **SDR re-check (run r19, the branch's shipped defaults).** 6/6 teleports with 3D on throughout
 (pairs 1392 → 3012). Then a checkpoint restart: the game kept presenting (present 31399 → 34590)
@@ -607,7 +637,7 @@ python3 -I re/scripts/stereo_sbs.py disp OUTDIR/s32_pe1a.bmp --ref OUTDIR/monoL.
 python3 -I re/scripts/stereo_sbs.py diff OUTDIR/s0_pe1a.bmp
 quiver lab set control-stereo "install:threshold.ini:[stereo]separation=65" --wait   # live keys
 # a frozen scene (this round): Escape, Down Down Return (Photo Mode), t (hide its UI), then
-re/scripts/stereo_ab.sh control-stereo OUTDIR -n 2 shared:history_mask=30 pereye:history_mask=31
+re/scripts/stereo_ab.sh control-stereo OUTDIR -n 2 shared:history_mask=30 pereye:history_mask=63
 python3 -I re/scripts/stereo_sbs.py refl OUTDIR/pereye_*.bmp --ref OUTDIR/monoL.bmp OUTDIR/monoR.bmp --region edge:1680,640,1920,1080
 quiver lab call control-stereo stereo graph        # both persisted lists (hash, type, flags, texture)
 quiver lab call control-stereo stereo grab gr 1 T  # a history texture as raw texels (gl/gr list entry, dlfL/dlfR, ssaoL/ssaoR, bb)
