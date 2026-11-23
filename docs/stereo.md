@@ -367,6 +367,7 @@ Not implemented: FG is not settled, and (a)-(c) mean two features and two input 
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
 | dev: `history_mask` | 30 | 1 graph persisted list (off by default: measured worse), 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
+| dev: `load_mono` | 1 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading): avoids the level-change GPU fault |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | dev: `hdr_hud_wide` | 0 | start-up: HDR UI target allocated 2W (HUD in both eyes; hung the GPU in r25) |
@@ -459,6 +460,36 @@ Next suspects, bisected on HDR (SDR survived 7 loads; every HDR run with telepor
 cleanup between the eyes (Scene update runs `executeDeferredThreadCleanup` per render, renderer
 +0x124258; the RT job's `finishThread` cleanup at +0xa8c55), while the other eye's commands still
 reference it.
+
+**Bisect (rayblaster, HDR, first teleport to mail-room; the user was playing, lab throttled):**
+
+| run | setting | result |
+|---|---|---|
+| r8 | sbs, async build held off, `hdr_hud_wide` | hang (Xid 109) |
+| r9 | sbs, async build + async ray dispatch held off, `hdr_hud_wide` | hang (Xid 13 MMU fault) |
+| r10 | as r9 without `hdr_hud_wide` | hang (Xid 109) |
+| r11 | sbs, `per_eye = 0`, `dlss_per_eye = 0` (all histories and DLSS shared) | hang |
+| r14 | sbs, `hud_both = 0` (no HUD draw duplication) | hang |
+| r12 | `mode = off`, `output = full` (mono duplicate into both halves) | 6/6 teleports, no timeouts |
+| r13 | `mode = left` (one render per update, camera moved) | 6/6 teleports |
+| r2 | SDR, sbs | 6/6 teleports + a checkpoint restart |
+
+So it needs the second render per update, and none of our per-eye pieces or the HUD causes it. The
+remaining pair-only pieces are the visibility-result reuse, SSAO's per-frame prepare, the `rand()`
+replay, the right eye's skipped video decode, and the engine rendering one packet twice while the
+level streams. The fault is a GPU page fault (a use-after-free): something the engine frees or
+recycles during streaming, on a once-per-update assumption, is still referenced by the other eye's
+commands. Not identified.
+
+**Fallback (commit below): mono while the engine changes level.** Pairs stop and the one image is
+duplicated into both halves (2D for the load) while any of these holds, plus a 2 s tail:
+- a jump point's streaming wait / player hide is pending: useJumpPoint exe+0x4823c0 hooked; it
+  sets bits 0/1 of jp+0xB8 until done (static, as nav reads them);
+- an episode reload started (`ServerGameSession::startReloadingEpisodeFromJumpPoint`, export, hooked)
+  and not finished;
+- `coregame::onIsLoading()` returns true.
+Dev `load_mono = 0` renders pairs through loads. `stereo status`: `level_changes`, `load_mono`
+(mono frames).
 
 **Superseded: under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
 off (`rt_async_hold`; dev `rt_async_build = 1` keeps the engine's setting). The build then runs on

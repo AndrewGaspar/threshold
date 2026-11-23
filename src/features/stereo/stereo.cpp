@@ -467,6 +467,92 @@ void rt_async_hold(bool hold) {
   hold_byte(d3d_rt_upload(), g_rt_upload_saved, h, "RT async upload (async ray dispatch)");
 }
 
+// ---- level changes render one eye ----------------------------------------------------------------
+// A level change (jump point: fast travel, teleports; checkpoint reload) in sbs hung the GPU on HDR
+// runs: a page fault (Xid 13) or context-switch timeout a few seconds into the jump's streaming
+// wait (docs/stereo.md, "Level-change hang"). The same jump with one render per update (mode
+// left/off) is fine, so while the engine changes level the frame is rendered mono (`end` puts it in
+// both halves: 2D in the glasses for the load) and pairs resume once it is done.
+// - jump points: exe+0x4823c0 useJumpPoint(jp, reload, debug) sets bits 0/1 of jp+0xB8 while its
+//   streaming wait / player hide is pending (static; nav.cpp reads the same bits);
+// - episode reloads: coregame ServerGameSession::startReloadingEpisodeFromJumpPoint (export);
+// - coregame::onIsLoading() (export, a std::function<bool()>), what the engine itself asks.
+// Plus a 2 s tail after each. stereo.load_mono = 0 renders pairs through loads (for testing).
+using UseJp_t = void(__fastcall*)(void* jp, bool reload, bool debug);
+using Reload_t = void(__fastcall*)(void* ses, const void* jp, bool flag);
+UseJp_t o_useJp;
+Reload_t o_reload;
+std::atomic<void*> g_lc_jp{nullptr};
+std::atomic<uint64_t> g_lc_reload_tick{0}, g_lc_tail_until{0};
+std::atomic<bool> g_load_mono{true};
+std::atomic<uint64_t> g_n_load_mono{0}, g_n_level_changes{0};
+uintptr_t g_onIsLoading = 0;
+void __fastcall hk_useJp(void* jp, bool reload, bool debug) {
+  g_lc_jp = jp;
+  g_lc_tail_until = GetTickCount64() + 2000;
+  g_n_level_changes++;
+  o_useJp(jp, reload, debug);
+}
+void __fastcall hk_reload(void* ses, const void* jp, bool flag) {
+  g_lc_reload_tick = GetTickCount64();
+  g_lc_tail_until = GetTickCount64() + 5000;
+  g_n_level_changes++;
+  o_reload(ses, jp, flag);
+}
+bool readable_byte(const void* p) {
+  MEMORY_BASIC_INFORMATION mi{};
+  if (!VirtualQuery(p, &mi, sizeof mi) || mi.State != MEM_COMMIT) return false;
+  return (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+}
+bool engine_loading() {
+  if (!g_onIsLoading) return false;
+  void* impl = *reinterpret_cast<void**>(g_onIsLoading + 0x38);  // MSVC std::function: impl at +0x38
+  if (!impl) return false;
+  auto vt = *reinterpret_cast<uintptr_t**>(impl);
+  HMODULE m = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(vt[2]), &m))
+    return false;
+  return reinterpret_cast<bool (*)(void*)>(vt[2])(impl);
+}
+bool level_changing() {
+  if (!g_load_mono.load()) return false;
+  uint64_t now = GetTickCount64();
+  bool busy = false;
+  if (void* jp = g_lc_jp.load()) {
+    auto* b = static_cast<uint8_t*>(jp) + 0xB8;
+    if (readable_byte(b) && (*b & 3)) busy = true;
+    else g_lc_jp = nullptr;
+  }
+  uint64_t rt = g_lc_reload_tick.load();
+  if (rt && now - rt < 60000) busy = true;  // until the engine reports the load (below), at most 60 s
+  if (engine_loading()) {
+    busy = true;
+    g_lc_reload_tick = 0;
+  }
+  if (busy) {
+    g_lc_tail_until = now + 2000;
+    return true;
+  }
+  return now < g_lc_tail_until.load();
+}
+void level_hooks_start() {
+  const Image& exe = game_image();
+  void* uj = reinterpret_cast<void*>(exe.at(0x4823c0));
+  if (sig_match(uj, "48 8b c4 55 57 41 54 41 56 41 57 48 8d 6c 24 a0"))
+    hook_fn(uj, (void*)hk_useJp, (void**)&o_useJp, "useJumpPoint (stereo: mono during level changes)");
+  else
+    TH_LOG("stereo: useJumpPoint signature mismatch: jumps render in 3D");
+  constexpr wchar_t kCore[] = L"coregame_rmdwin10_f.dll";
+  if (void* rl = module_export(kCore,
+                               "?startReloadingEpisodeFromJumpPoint@ServerGameSession@coregame@@QEAAXAEBV?$InplaceString@$0EA@@r@@_N@Z",
+                               "stereo");
+      rl && sig_match(rl, "40 57 48 81 ec f0 00 00 00 48 c7 44 24 28 fe ff"))
+    hook_fn(rl, (void*)hk_reload, (void**)&o_reload, "startReloadingEpisodeFromJumpPoint (stereo)");
+  g_onIsLoading = reinterpret_cast<uintptr_t>(
+      module_export(kCore, "?onIsLoading@coregame@@3V?$function@$$A6A_NXZ@std@@A", "stereo"));
+}
+
 double eye_offset(const Params& p, int eye) {
   if (eye == 0) return 0;
   double e = p.separation_mm / 1000.0 * eye;
@@ -563,8 +649,11 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
     render_eye(r, view, a3, a4, a5, p, p.mode == Mode::Left ? -1 : 1, true, -1);
     return;
   }
-  // sbs: needs a packed output and our GPU side; only the first world render of a frame.
-  if (!packed_now() || !gpu_ready() || nth != 0 || at<uint8_t>(r, kRDeviceLost)) {
+  // sbs: needs a packed output and our GPU side; only the first world render of a frame; not while
+  // the engine changes level (level_changing).
+  bool loading = nth == 0 && level_changing();
+  if (loading) g_n_load_mono++;
+  if (!packed_now() || !gpu_ready() || nth != 0 || loading || at<uint8_t>(r, kRDeviceLost)) {
     if (nth == 0) g_n_mono_fallback++;
     if (nth == 0) rt_async_hold(false);
     eyestate_mono(r);
@@ -855,7 +944,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -863,7 +952,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
@@ -1012,6 +1101,8 @@ void stereo_register() {
     } else if (id == "stereo.output") {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
+    } else if (id == "stereo.load_mono") {
+      g_load_mono = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.rt_async_build") {
       g_rt_async_keep = truthy(v);
     } else if (id == "stereo.hdr_hud_wide") {
@@ -1126,6 +1217,7 @@ void stereo_start() {
   }
   eyestate_start(g_rimg);
   if (cfg_bool("stereo.fence_trace", false)) fence_trace_start();
+  level_hooks_start();
   if (cfg_bool("stereo.hdr_hud_wide", false) &&
       !hook_fn((void*)g_rt_alloc, (void*)hk_rt_alloc, (void**)&o_rt_alloc, "RenderTargetManager::allocTexture2D"))
     o_rt_alloc = nullptr;  // only hooked when the dev option asks for it (start-up)
