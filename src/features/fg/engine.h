@@ -22,12 +22,22 @@ struct Camera {
 // Reads the main view now (call inside the world render: the DLSS evaluate tap).
 bool camera_read(Camera& c);
 void camera_log(const Camera& c);  // occasional diagnostics
+// The camera of a horizontal crop of its image: eye pixels [p0, p0 + wc) of `w` (a sub-rectangle that
+// leaves out columns a convergence shift uncovered). Clip x' = x * w / wc + clip w * ((w - 2 p0) / wc - 1)
+// (row vectors: M' = M C, inverses C^-1 M, clip-to-previous C^-1 M C); the aspect follows.
+void camera_crop(const Camera& in, int p0, int wc, int w, Camera& out);
 
 // HUD-less colour: a copy of the colour target taken at renderHUD entry (RendererX86 vtable slot 17,
 // patched in the vtable: the slot is only ever called through it, and a vtable patch composes with
 // an inline detour of the function body, e.g. stereo's). Armed per frame by the DLSS evaluate tap.
 bool hudless_install();
 void hudless_arm(bool on);  // copy at the next renderHUD
+// Stereo: while `pending()` is true at renderHUD entry the tap leaves the copy to hudless_copy_from
+// (the side-by-side texture before the HUD), still armed.
+void hudless_defer(bool (*pending)());
+// Copies `src_nt` (d3d::NativeTexture*) as this frame's HUD-less colour if armed (renderer thread,
+// inside renderHUD, on the engine's list).
+bool hudless_copy_from(void* renderer, void* src_nt);
 struct EngTex {
   ID3D12Resource* r = nullptr;
   D3D12_RESOURCE_STATES st = D3D12_RESOURCE_STATE_COMMON;  // the engine's tracked state (restore it)

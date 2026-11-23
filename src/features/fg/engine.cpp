@@ -138,43 +138,60 @@ bool finite(const M4& a) {
 // ---- HUD-less ----
 std::atomic<bool> g_hud_arm{false};
 bool g_hud_have = false;  // a copy was taken since the last take (renderer thread)
-void* g_hud_tex = nullptr;  // Texture2D* from the engine's pool
-int g_hud_w = 0, g_hud_h = 0, g_hud_fmt = -1;
+// Texture2D* from the engine's pool, one per size/format seen (at most two: the eye-wide colour target
+// and stereo's 2W side-by-side texture); g_hud_cur is the latest copy's.
+struct HudTex {
+  void* tex = nullptr;
+  int w = 0, h = 0, fmt = -1;
+};
+HudTex g_hud[2];
+int g_hud_cur = 0, g_hud_next = 0;
+bool (*g_hud_pending)() = nullptr;
 std::atomic<uint64_t> g_hud_n{0};
 
 void* hud_texture(void* r, void* src_nt) {
   int w = at<int>(src_nt, kNtWidth), h = at<int>(src_nt, kNtHeight), fmt = at<int8_t>(src_nt, kNtPixelFormat);
-  if (g_hud_tex && g_hud_w == w && g_hud_h == h && g_hud_fmt == fmt) return g_get_native(g_hud_tex);
+  for (int i = 0; i < 2; ++i)
+    if (g_hud[i].tex && g_hud[i].w == w && g_hud[i].h == h && g_hud[i].fmt == fmt) {
+      g_hud_cur = i;
+      return g_get_native(g_hud[i].tex);
+    }
   void* mgr = at<void*>(r, kRRtManager);
   if (!mgr) return nullptr;
-  // On a size or format change the old texture stays allocated from the pool (one per resolution
-  // change, a few MB); it is never handed back, so nothing else can be given it while we use it.
+  // A size or format not cached: a new texture in the next slot. The one it replaces stays allocated
+  // from the pool (one per resolution change, a few MB); it is never handed back, so nothing else can
+  // be given it while a copy may still be in flight.
   alignas(16) uint8_t init[kTexture2DInitSize + 0x20] = {};
   alignas(16) float clear[4] = {0, 0, 0, 0};
   // As renderHUD makes the colour target: (w, h, 1 mip, format, usage 5, ..., 0.5f, 1, clear, -1).
   g_tex2d_init(init, w, h, 1, fmt, 5, 0, nullptr, 0, 0, 0, 0.5f, 1, clear, -1);
-  g_hud_tex = g_rt_alloc(mgr, init, "Threshold::fgHudLess");
-  g_hud_w = w, g_hud_h = h, g_hud_fmt = fmt;
-  void* nt = g_hud_tex ? g_get_native(g_hud_tex) : nullptr;
+  const int i = g_hud_next;
+  g_hud_next = (g_hud_next + 1) % 2;
+  g_hud[i] = {g_rt_alloc(mgr, init, "Threshold::fgHudLess"), w, h, fmt};
+  g_hud_cur = i;
+  void* nt = g_hud[i].tex ? g_get_native(g_hud[i].tex) : nullptr;
   ID3D12Resource* res = nt ? at<ID3D12Resource*>(nt, kNtResource) : nullptr;
   ID3D12Resource* sres = at<ID3D12Resource*>(src_nt, kNtResource);
-  TH_LOG("fg: HUD-less texture %dx%d pixel format %d (DXGI %d; colour target DXGI %d): %p", w, h, fmt,
-         res ? int(res->GetDesc().Format) : -1, sres ? int(sres->GetDesc().Format) : -1, g_hud_tex);
+  TH_LOG("fg: HUD-less texture %dx%d pixel format %d (DXGI %d; source DXGI %d): %p", w, h, fmt,
+         res ? int(res->GetDesc().Format) : -1, sres ? int(sres->GetDesc().Format) : -1, g_hud[i].tex);
   return nt;
 }
 
+bool copy_from(void* r, void* src) {
+  void* dst = src ? hud_texture(r, src) : nullptr;
+  if (!dst) return false;
+  int w = at<int>(src, kNtWidth), h = at<int>(src, kNtHeight);
+  int p0[3] = {0, 0, 0}, sz[3] = {w, h, 1};
+  g_copy_region(dst, 0, 0, p0, src, 0, 0, p0, sz);
+  g_hud_have = true;
+  g_hud_n++;
+  return true;
+}
+
 void __fastcall hk_renderHUD(void* r) {
-  if (g_hud_arm.exchange(false)) {
+  if (!(g_hud_pending && g_hud_pending()) && g_hud_arm.exchange(false)) {
     void* t2d = at<void*>(r, kRColor);
-    void* src = t2d ? g_get_native(t2d) : nullptr;
-    void* dst = src ? hud_texture(r, src) : nullptr;
-    if (dst) {
-      int w = at<int>(src, kNtWidth), h = at<int>(src, kNtHeight);
-      int p0[3] = {0, 0, 0}, sz[3] = {w, h, 1};
-      g_copy_region(dst, 0, 0, p0, src, 0, 0, p0, sz);
-      g_hud_have = true;
-      g_hud_n++;
-    } else {
+    if (!copy_from(r, t2d ? g_get_native(t2d) : nullptr)) {
       static int n = 0;
       if (n++ < 3) TH_LOG("fg: renderHUD without a colour target (+0x3c8 %p): no HUD-less this frame", t2d);
     }
@@ -250,6 +267,26 @@ bool camera_read(Camera& c) {
   return c.ok;
 }
 
+void camera_crop(const Camera& in, int p0, int wc, int w, Camera& out) {
+  out = in;
+  if (!in.ok || wc <= 0 || w <= 0 || (p0 == 0 && wc == w)) return;
+  const double k = double(w) / wc, o = double(w - 2 * p0) / wc - 1;
+  M4 c, ci;  // identity but column 0: x' = x k + w o
+  for (int i = 0; i < 4; ++i) c.m[i][i] = ci.m[i][i] = 1;
+  c.m[0][0] = k, c.m[3][0] = o;
+  ci.m[0][0] = 1 / k, ci.m[3][0] = -o / k;
+  auto ld = [](const float f[16]) {
+    M4 m;
+    for (int i = 0; i < 16; ++i) m.m[i / 4][i % 4] = f[i];
+    return m;
+  };
+  store(mul(ld(in.view_to_clip), c), out.view_to_clip);
+  store(mul(ci, ld(in.clip_to_view)), out.clip_to_view);
+  store(mul(mul(ci, ld(in.clip_to_prev)), c), out.clip_to_prev);
+  store(mul(mul(ci, ld(in.prev_to_clip)), c), out.prev_to_clip);
+  out.aspect = float(in.aspect / k);
+}
+
 void camera_log(const Camera& c) {
   static int64_t last = 0;
   static int n = 0;
@@ -272,11 +309,30 @@ void camera_log(const Camera& c) {
          c.clip_to_prev[15], eng[0], eng[1], eng[2], eng[3], eng[12], eng[13], eng[14], eng[15]);
 }
 
+// The body's first instruction jumps (directly, or through MinHook's relay) into this module: our own
+// inline detour of it (stereo's, made after stereo checked the same signature).
+bool detoured_by_us(void* fn) {
+  HMODULE self = nullptr;
+  GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                     reinterpret_cast<LPCWSTR>(&detoured_by_us), &self);
+  const uint8_t* p = static_cast<const uint8_t*>(fn);
+  for (int hop = 0; hop < 3 && p; ++hop) {
+    HMODULE m = nullptr;
+    if (hop && GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                                  reinterpret_cast<LPCWSTR>(p), &m) && m == self)
+      return true;
+    if (p[0] == 0xE9) p = p + 5 + *reinterpret_cast<const int32_t*>(p + 1);
+    else if (p[0] == 0xFF && p[1] == 0x25) p = *reinterpret_cast<const uint8_t* const*>(p + 6 + *reinterpret_cast<const int32_t*>(p + 2));
+    else return false;
+  }
+  return false;
+}
+
 bool hudless_install() {
   if (!g_ok) return false;
   void** vt = reinterpret_cast<void**>(g_rimg.at(kRvaVtbl));
   void* body = (void*)g_rimg.at(kRvaRenderHUD);
-  if (!sig_match(body, kSigRenderHUD)) {
+  if (!sig_match(body, kSigRenderHUD) && !detoured_by_us(body)) {
     TH_LOG("fg: renderHUD signature mismatch: no HUD-less");
     return false;
   }
@@ -293,10 +349,18 @@ bool hudless_install() {
 
 void hudless_arm(bool on) { g_hud_arm = on; }
 
+void hudless_defer(bool (*pending)()) { g_hud_pending = pending; }
+
+bool hudless_copy_from(void* r, void* src_nt) {
+  if (!g_ok || !g_hud_arm.exchange(false)) return false;
+  return copy_from(r, src_nt);
+}
+
 bool hudless_take(EngTex& t) {
-  if (!g_hud_have || !g_hud_tex) return false;
+  void* tex = g_hud[g_hud_cur].tex;
+  if (!g_hud_have || !tex) return false;
   g_hud_have = false;
-  void* nt = g_get_native(g_hud_tex);
+  void* nt = g_get_native(tex);
   if (!nt) return false;
   t.r = at<ID3D12Resource*>(nt, kNtResource);
   uint8_t* blk = at<uint8_t*>(nt, kNtStatePtr);

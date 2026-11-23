@@ -165,12 +165,33 @@ struct Inputs {
 };
 
 struct Set {
-  Tex real, depth, mv, out[kMaxGen];
+  // depth / mv / in: [0] the frame's only render, or the left eye of a stereo pair; [1] the right eye.
+  Tex real, depth[2], mv[2], out[kMaxGen];
   // HDR (FP16 scRGB swapchain): DLSS-G works on HDR10 PQ copies (hdr.cpp). enc / hud_enc: the real
   // frame and the HUD-less colour encoded; dec: the generated frames decoded back to scRGB (presented).
   Tex enc, hud_enc, dec[kMaxGen];
-  D3D12_RESOURCE_DESC depth_desc{}, mv_desc{};
-  Inputs in;
+  D3D12_RESOURCE_DESC depth_desc[2]{}, mv_desc[2]{};
+  Inputs in[2];
+};
+
+// One DLSS-G evaluation's share of the frame: the whole frame, or one eye's half of a side-by-side
+// frame (stereo). Sub-rectangles in pixels; y is always 0 and the height the frame's.
+struct View {
+  unsigned bx = 0, bw = 0;     // backbuffer / HUD-less / outputs
+  unsigned hx = 0, hw = 0;     // HUD-less (its own texture may be one eye wide)
+  bool hud = false;
+  unsigned dx = 0, dw = 0;     // depth and MVs (render pixels)
+  int crop_p0 = 0, crop_wc = 0, crop_w = 0;  // the eye image columns shown (camera crop); wc 0 = all
+  unsigned eye = 0;            // inputs / feature index
+  unsigned fw = 0;             // the feature's width (= bw: DLSS-G wants the sub-rectangle at its size)
+};
+
+// A DLSS-G feature: one for mono, one per eye with stereo.
+struct Feature {
+  void* h = nullptr;
+  unsigned w = 0, hh = 0, rw = 0, rh = 0, gen = 0;
+  DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+  bool reset = true;
 };
 
 struct Job {
@@ -229,15 +250,24 @@ struct State {
   unsigned frame = 0;  // game presents since start, picks the set
 
   bool ngx_ok = false, ngx_tried = false;
-  void* feature = nullptr;
+  Feature feat[2];  // [1]: the right eye's (stereo)
   void* cparams = nullptr;
   void* eparams = nullptr;
   unsigned caps_max_gen = 1;
-  unsigned feat_w = 0, feat_h = 0, feat_rw = 0, feat_rh = 0, feat_gen = 0;
-  DXGI_FORMAT feat_fmt = DXGI_FORMAT_UNKNOWN;
   bool hdr = false;  // the swapchain is FP16 scRGB: DLSS-G runs on HDR10 PQ copies
   bool reset = true;
   uint64_t bb_id = 0;
+
+  // stereo (fg_stereo_*): the link, and the layout stereo's `end` reported for the frame being presented
+  FgStereoLink link{};
+  struct Layout {
+    bool on = false;
+    int pack = 0, w = 0, shift[2] = {0, 0};
+    bool pair = false;
+  } lay, cur;  // lay: as reported (renderer thread, stereo's `end`); cur: the frame takeover works on
+  std::atomic<unsigned> p_views2{0};  // frames evaluated per eye (perf window)
+  std::atomic<bool> stereo_shared{false};  // dev [fg] stereo_features = 1: one feature (history) for both eyes
+  std::atomic<uint64_t> n_views2{0}, n_views2_mono{0};
 
   // present thread
   std::mutex mu;
@@ -267,15 +297,20 @@ struct State {
 
 uint32_t __cdecl hk_Eval(ID3D12GraphicsCommandList* cl, const void* handle, const void* params, void* cb) {
   uint32_t r = o_Eval(cl, handle, params, cb);
-  if (!S.enabled || !S.dev || handle == S.feature || ngx_failed(r) || !params) return r;
+  if (!S.enabled || !S.dev || handle == S.feat[0].h || handle == S.feat[1].h || ngx_failed(r) || !params) return r;
   void* p = const_cast<void*>(params);
   ID3D12Resource* depth = nullptr;
   ID3D12Resource* mv = nullptr;
   if (ngx_failed(N.GetRes(p, NVSDK_NGX_Parameter_Depth, &depth)) || !depth ||
       ngx_failed(N.GetRes(p, NVSDK_NGX_Parameter_MotionVectors, &mv)) || !mv)
     return r;
+  // Stereo: the eye whose world render this is (each eye has its own SR feature, depth, MVs and
+  // camera); else the frame's only render.
+  const int eye = S.link.eye ? S.link.eye() : -1;
+  const unsigned e = eye == 1 ? 1 : 0;
   Set& st = S.sets[S.frame % kSets];
-  Inputs& in = st.in;
+  Inputs& in = st.in[e];
+  if (eye < 0) st.in[1].ok = false;
   unsigned rw = 0, rh = 0;
   N.GetUI(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Width, &rw);
   N.GetUI(p, NVSDK_NGX_Parameter_DLSS_Render_Subrect_Dimensions_Height, &rh);
@@ -292,33 +327,35 @@ uint32_t __cdecl hk_Eval(ID3D12GraphicsCommandList* cl, const void* handle, cons
   auto same = [](const D3D12_RESOURCE_DESC& a, const D3D12_RESOURCE_DESC& b) {
     return a.Width == b.Width && a.Height == b.Height && a.Format == b.Format && a.Flags == b.Flags;
   };
-  if (!st.depth.r || !same(st.depth_desc, dd)) {
-    if (!make_tex(S.dev, st.depth, dd, D3D12_RESOURCE_STATE_COPY_DEST, L"threshold fg depth")) return r;
-    st.depth_desc = dd;
-    TH_LOG("fg: depth input %llux%u fmt %d flags 0x%x, motion vectors %llux%u fmt %d", (unsigned long long)dd.Width,
-           dd.Height, int(dd.Format), int(dd.Flags), (unsigned long long)md.Width, md.Height, int(md.Format));
+  if (!st.depth[e].r || !same(st.depth_desc[e], dd)) {
+    if (!make_tex(S.dev, st.depth[e], dd, D3D12_RESOURCE_STATE_COPY_DEST, e ? L"threshold fg depth R" : L"threshold fg depth")) return r;
+    st.depth_desc[e] = dd;
+    TH_LOG("fg: depth input%s %llux%u fmt %d flags 0x%x, motion vectors %llux%u fmt %d", e ? " (right eye)" : "",
+           (unsigned long long)dd.Width, dd.Height, int(dd.Format), int(dd.Flags), (unsigned long long)md.Width,
+           md.Height, int(md.Format));
   }
-  if (!st.mv.r || !same(st.mv_desc, md)) {
-    if (!make_tex(S.dev, st.mv, md, D3D12_RESOURCE_STATE_COPY_DEST, L"threshold fg mv")) return r;
-    st.mv_desc = md;
+  if (!st.mv[e].r || !same(st.mv_desc[e], md)) {
+    if (!make_tex(S.dev, st.mv[e], md, D3D12_RESOURCE_STATE_COPY_DEST, e ? L"threshold fg mv R" : L"threshold fg mv")) return r;
+    st.mv_desc[e] = md;
   }
   // NGX takes its inputs as shader resources; the engine leaves them so (re/dlss.md 1.5).
   const auto kSrv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE | D3D12_RESOURCE_STATE_PIXEL_SHADER_RESOURCE;
   barrier(cl, depth, kSrv, D3D12_RESOURCE_STATE_COPY_SOURCE);
   barrier(cl, mv, kSrv, D3D12_RESOURCE_STATE_COPY_SOURCE);
-  to(cl, st.depth, D3D12_RESOURCE_STATE_COPY_DEST);
-  to(cl, st.mv, D3D12_RESOURCE_STATE_COPY_DEST);
-  cl->CopyResource(st.depth.r, depth);
-  cl->CopyResource(st.mv.r, mv);
+  to(cl, st.depth[e], D3D12_RESOURCE_STATE_COPY_DEST);
+  to(cl, st.mv[e], D3D12_RESOURCE_STATE_COPY_DEST);
+  cl->CopyResource(st.depth[e].r, depth);
+  cl->CopyResource(st.mv[e].r, mv);
   barrier(cl, depth, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrv);
   barrier(cl, mv, D3D12_RESOURCE_STATE_COPY_SOURCE, kSrv);
   in.ok = true;
   if (!camera_read(in.cam)) in.cam.ok = false;
-  lat_eval(cl, in.cam, S.frame);
+  if (e == 0) lat_eval(cl, in.cam, S.frame);
   hudless_arm(S.engine_ok && S.hudless.load());  // this frame has DLSS inputs: copy its HUD-less colour
   static int logged = 0;
-  if (logged++ < 2)
-    TH_LOG("fg: inputs render %ux%u jitter %.3f,%.3f px, MV scale %.1f,%.1f", in.rw, in.rh, in.jx, in.jy, in.mvx, in.mvy);
+  if (logged++ < (S.link.eye ? 4 : 2))
+    TH_LOG("fg: inputs%s render %ux%u jitter %.3f,%.3f px, MV scale %.1f,%.1f", eye < 0 ? "" : e ? " (right eye)" : " (left eye)",
+           in.rw, in.rh, in.jx, in.jy, in.mvx, in.mvy);
   return r;
 }
 
@@ -348,22 +385,22 @@ bool ensure_ngx() {
 // The format DLSS-G sees: the swapchain's, or HDR10 (R10G10B10A2 PQ) for an scRGB swapchain.
 DXGI_FORMAT ngx_fmt() { return S.hdr ? DXGI_FORMAT_R10G10B10A2_UNORM : S.fmt; }
 
-bool ensure_feature(unsigned rw, unsigned rh) {
+// Feature `i` for a `w` x S.h sub-rectangle (the whole frame, or one eye) at render size rw x rh.
+bool ensure_feature(unsigned i, unsigned w, unsigned rw, unsigned rh) {
+  Feature& f = S.feat[i];
   unsigned gen = S.caps_max_gen;  // created for the largest count; evaluations may use fewer
-  if (S.feature && S.feat_w == S.w && S.feat_h == S.h && S.feat_rw == rw && S.feat_rh == rh && S.feat_gen == gen &&
-      S.feat_fmt == ngx_fmt())
-    return true;
-  if (S.feature) {
+  if (f.h && f.w == w && f.hh == S.h && f.rw == rw && f.rh == rh && f.gen == gen && f.fmt == ngx_fmt()) return true;
+  if (f.h) {
     S.rring.wait(S.rring.next);
-    N.Release(S.feature);
-    S.feature = nullptr;
+    N.Release(f.h);
+    f.h = nullptr;
   }
   void* p = S.cparams;
   N.SetUI(p, NVSDK_NGX_Parameter_CreationNodeMask, 1);
   N.SetUI(p, NVSDK_NGX_Parameter_VisibilityNodeMask, 1);
-  N.SetUI(p, NVSDK_NGX_Parameter_Width, S.w);
+  N.SetUI(p, NVSDK_NGX_Parameter_Width, w);
   N.SetUI(p, NVSDK_NGX_Parameter_Height, S.h);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Width, S.w);
+  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Width, w);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Height, S.h);
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFormat, unsigned(ngx_fmt()));
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, gen);
@@ -372,17 +409,28 @@ bool ensure_feature(unsigned rw, unsigned rh) {
   N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DynamicResolution, 0);
   int64_t t0 = now_us();
   ID3D12GraphicsCommandList* cl = S.rring.begin();
-  uint32_t r = N.Create(cl, NVSDK_NGX_Feature_FrameGeneration, p, &S.feature);
+  uint32_t r = N.Create(cl, NVSDK_NGX_Feature_FrameGeneration, p, &f.h);
   S.rring.wait(S.rring.submit(S.q));
-  TH_LOG("fg: CreateFeature(FrameGeneration %ux%u, render %ux%u, format %d, count %u) = 0x%08x (%.0f ms)", S.w, S.h, rw,
-         rh, int(ngx_fmt()), gen, r, (now_us() - t0) / 1000.0);
-  if (ngx_failed(r) || !S.feature) {
-    S.feature = nullptr;
+  TH_LOG("fg: CreateFeature(FrameGeneration%s %ux%u, render %ux%u, format %d, count %u) = 0x%08x (%.0f ms)",
+         i ? " right eye" : "", w, S.h, rw, rh, int(ngx_fmt()), gen, r, (now_us() - t0) / 1000.0);
+  if (ngx_failed(r) || !f.h) {
+    f.h = nullptr;
     return false;
   }
-  S.feat_w = S.w, S.feat_h = S.h, S.feat_rw = rw, S.feat_rh = rh, S.feat_gen = gen, S.feat_fmt = ngx_fmt();
-  S.reset = true;
+  f.w = w, f.hh = S.h, f.rw = rw, f.rh = rh, f.gen = gen, f.fmt = ngx_fmt();
+  f.reset = true;
   return true;
+}
+
+// The stereo right eye's feature when it isn't used (stereo off or one view): released after the GPU
+// is done with it, once.
+void release_feature(unsigned i) {
+  Feature& f = S.feat[i];
+  if (!f.h) return;
+  S.rring.wait(S.rring.next);
+  N.Release(f.h);
+  TH_LOG("fg: DLSS-G feature %u released", i);
+  f = Feature{};
 }
 
 bool ensure_outputs(Set& st, unsigned n) {
@@ -416,8 +464,12 @@ bool ensure_outputs(Set& st, unsigned n) {
   return true;
 }
 
-// Records copy-aside + DLSS-G evaluation for this frame; returns the number of generated frames.
-unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* hud) {
+// The feature view v evaluates with (dev [fg] stereo_features = 1: the left eye's for both).
+unsigned fi(unsigned v) { return S.stereo_shared.load() ? 0 : v; }
+
+// Records copy-aside + DLSS-G evaluation for this frame (one evaluation per view and generated index);
+// returns the number of generated frames.
+unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* hud, const View* views, unsigned nv) {
   ID3D12GraphicsCommandList* cl = S.rring.begin();
   lat_begin(cl, S.frame);
   // The real frame, set aside (the engine renders into this proxy again two frames later).
@@ -431,115 +483,166 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
   }
   const auto kSrv = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
   to(cl, st.real, kSrv);
-  to(cl, st.depth, kSrv);
-  to(cl, st.mv, kSrv);
+  for (unsigned v = 0; v < nv; ++v) {
+    to(cl, st.depth[views[v].eye], kSrv);
+    to(cl, st.mv[views[v].eye], kSrv);
+  }
   void* p = S.eparams;
-  const Inputs& in = st.in;
   const unsigned slot0 = unsigned(&st - S.sets) * 8;  // hdr.cpp descriptor slots of this set
   if (S.hdr) {  // scRGB -> HDR10 PQ for DLSS-G
     to(cl, st.enc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
     hdr_convert(cl, st.real.r, st.enc.r, true, slot0);
     to(cl, st.enc, kSrv);
   }
-  N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Backbuffer, S.hdr ? st.enc.r : st.real.r);
-  N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Depth, st.depth.r);
-  N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_MVecs, st.mv.r);
+  Tex& input = S.hdr ? st.enc : st.real;  // what DLSS-G reads as the backbuffer
   // HUD-less colour (engine.cpp): the colour target before the UI, in the engine's tracked state.
+  ID3D12Resource* hl = nullptr;
   if (hud) {
     barrier(cl, hud->r, hud->st, kSrv);
-    D3D12_RESOURCE_DESC hd = hud->r->GetDesc();
-    ID3D12Resource* hl = hud->r;
+    hl = hud->r;
     if (S.hdr) {  // the HUD-less colour is scRGB too (checked at the take): encoded like the real frame
       to(cl, st.hud_enc, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
       hdr_convert(cl, hud->r, st.hud_enc.r, true, slot0 + 1);
       to(cl, st.hud_enc, kSrv);
       hl = st.hud_enc.r;
     }
-    N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hl);
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseX, 0);
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseY, 0);
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, std::min<unsigned>(unsigned(hd.Width), S.w));
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, std::min<unsigned>(hd.Height, S.h));
-  } else {
-    N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, nullptr);
   }
-  // Camera: the engine's main view ([fg] camera = engine, engine.cpp), else identity matrices and a
-  // synthetic basis (an all-zero basis is "not a valid frame" for DLSS-G).
-  static Camera cam;  // NGX keeps the pointers until the evaluation is recorded
-  const bool use_cam = S.cam_engine.load() && in.cam.ok;
-  if (use_cam) {
-    cam = in.cam;
-    N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, cam.view_to_clip);
-    N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, cam.clip_to_view);
-    N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, cam.clip_to_prev);
-    N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, cam.prev_to_clip);
-    N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, const_cast<float*>(kIdentity));
-    camera_log(cam);
-  } else {
-    for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
-                          NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
-                          NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
-      N.SetPtr(p, m, const_cast<float*>(kIdentity));
+  for (unsigned i = 0; i < n_gen; ++i) to(cl, st.out[i], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+  // Camera per view: the engine's main view read in that view's own render ([fg] camera = engine,
+  // engine.cpp; cropped to the columns the view shows), else identity matrices and a synthetic basis
+  // (an all-zero basis is "not a valid frame" for DLSS-G).
+  static Camera cam[2];  // NGX keeps the pointers until the evaluation is recorded
+  bool use_cam[2] = {false, false};
+  for (unsigned v = 0; v < nv; ++v) {
+    const Inputs& in = st.in[views[v].eye];
+    use_cam[v] = S.cam_engine.load() && in.cam.ok;
+    if (use_cam[v]) camera_crop(in.cam, views[v].crop_p0, views[v].crop_wc, views[v].crop_w, cam[v]);
   }
-  const float synth[4][3] = {{0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}};  // pos, up, right, forward
-  float basis[4][3];
-  for (int v = 0; v < 4; ++v)
-    for (int c = 0; c < 3; ++c) {
-      const float* src = !use_cam ? synth[v] : v == 0 ? cam.pos : v == 1 ? cam.up : v == 2 ? cam.right : cam.fwd;
-      basis[v][c] = src[c];
+  bool reset[2];
+  for (unsigned v = 0; v < nv; ++v) {
+    const Inputs& in = st.in[views[v].eye];
+    reset[v] = S.reset || S.feat[fi(v)].reset || in.reset || (use_cam[v] && !cam[v].has_prev);
+  }
+  unsigned made = n_gen;
+  for (unsigned i = 1; i <= n_gen && made == n_gen; ++i) {
+    for (unsigned v = 0; v < nv; ++v) {
+      const View& vw = views[v];
+      const Inputs& in = st.in[vw.eye];
+      N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Backbuffer, input.r);
+      N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_Depth, st.depth[vw.eye].r);
+      N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_MVecs, st.mv[vw.eye].r);
+      N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_HUDLess, hl && vw.hud ? hl : nullptr);
+      if (hl && vw.hud) {
+        N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseX, vw.hx);
+        N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectBaseY, 0);
+        N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectWidth, vw.hw);
+        N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_HUDLessSubrectHeight, S.h);
+      }
+      const Camera& c = cam[v];
+      if (use_cam[v]) {
+        N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, const_cast<float*>(c.view_to_clip));
+        N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView, const_cast<float*>(c.clip_to_view));
+        N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip, const_cast<float*>(c.clip_to_prev));
+        N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_PrevClipToClip, const_cast<float*>(c.prev_to_clip));
+        N.SetPtr(p, NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, const_cast<float*>(kIdentity));
+        if (i == 1 && v == 0) camera_log(c);
+      } else {
+        for (const char* m : {NVSDK_NGX_DLSSG_Parameter_CameraViewToClip, NVSDK_NGX_DLSSG_Parameter_ClipToCameraView,
+                              NVSDK_NGX_DLSSG_Parameter_ClipToLensClip, NVSDK_NGX_DLSSG_Parameter_ClipToPrevClip,
+                              NVSDK_NGX_DLSSG_Parameter_PrevClipToClip})
+          N.SetPtr(p, m, const_cast<float*>(kIdentity));
+      }
+      const float synth[4][3] = {{0, 0, 0}, {0, 1, 0}, {1, 0, 0}, {0, 0, 1}};  // pos, up, right, forward
+      const char* names[4][3] = {
+          {NVSDK_NGX_DLSSG_Parameter_CameraPosX, NVSDK_NGX_DLSSG_Parameter_CameraPosY, NVSDK_NGX_DLSSG_Parameter_CameraPosZ},
+          {NVSDK_NGX_DLSSG_Parameter_CameraUpX, NVSDK_NGX_DLSSG_Parameter_CameraUpY, NVSDK_NGX_DLSSG_Parameter_CameraUpZ},
+          {NVSDK_NGX_DLSSG_Parameter_CameraRightX, NVSDK_NGX_DLSSG_Parameter_CameraRightY, NVSDK_NGX_DLSSG_Parameter_CameraRightZ},
+          {NVSDK_NGX_DLSSG_Parameter_CameraFwdX, NVSDK_NGX_DLSSG_Parameter_CameraFwdY, NVSDK_NGX_DLSSG_Parameter_CameraFwdZ}};
+      for (int b = 0; b < 4; ++b) {
+        const float* src = !use_cam[v] ? synth[b] : b == 0 ? c.pos : b == 1 ? c.up : b == 2 ? c.right : c.fwd;
+        for (int k = 0; k < 3; ++k) N.SetF(p, names[b][k], src[k]);
+      }
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraNear, use_cam[v] ? c.near_z : 0.1f);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFar, use_cam[v] ? c.far_z : 1000.0f);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFOV, use_cam[v] ? c.fov : 1.2f);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, use_cam[v] ? c.aspect : float(vw.bw) / float(S.h));
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
+      // The game's MVs are in UV units; DLSS SR's own MV scale (render size) turns them into pixels.
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecScaleX, in.mvx);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecScaleY, in.mvy);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, in.jx);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, in.jy);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue, 1.17549435e-38f);
+      if (i == 1 && v == 0) ++S.bb_id;
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, unsigned(S.bb_id));
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, S.hdr ? 1 : 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthInverted, 0);  // conventional Z (re/dlss.md 3)
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Reset, reset[v] ? 1 : 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MvecDilated, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MenuDetectionEnabled, 0);
+      N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MinRelativeLinearDepthObjectSeparation, 40.0f);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseX, vw.dx);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectBaseY, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth, vw.dw);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight, in.rh);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseX, vw.dx);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectBaseY, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth, vw.dw);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight, in.rh);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseX, vw.bx);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectBaseY, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth, vw.bw);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, S.h);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseX, vw.bx);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectBaseY, 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, vw.bw);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight, S.h);
+      // Two views write one output texture: each only inside its own sub-rectangle (by default DLSS-G
+      // also writes the uninterpolated backbuffer outside it, over the other eye's half).
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_EvalFlags, nv > 1 ? NVSDK_NGX_DLSSG_EvalFlags_UpdateOnlyInsideExtents : 0);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, n_gen);
+      N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
+      N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, st.out[i - 1].r);
+      uint32_t r = o_Eval(cl, S.feat[fi(v)].h, p, nullptr);
+      if (ngx_failed(r)) {
+        static int n = 0;
+        if (n++ < 5) TH_LOG("fg: Evaluate(view %u, index %u of %u) = 0x%08x", v, i, n_gen, r);
+        made = i - 1;
+        break;
+      }
     }
-  const char* names[4][3] = {
-      {NVSDK_NGX_DLSSG_Parameter_CameraPosX, NVSDK_NGX_DLSSG_Parameter_CameraPosY, NVSDK_NGX_DLSSG_Parameter_CameraPosZ},
-      {NVSDK_NGX_DLSSG_Parameter_CameraUpX, NVSDK_NGX_DLSSG_Parameter_CameraUpY, NVSDK_NGX_DLSSG_Parameter_CameraUpZ},
-      {NVSDK_NGX_DLSSG_Parameter_CameraRightX, NVSDK_NGX_DLSSG_Parameter_CameraRightY, NVSDK_NGX_DLSSG_Parameter_CameraRightZ},
-      {NVSDK_NGX_DLSSG_Parameter_CameraFwdX, NVSDK_NGX_DLSSG_Parameter_CameraFwdY, NVSDK_NGX_DLSSG_Parameter_CameraFwdZ}};
-  for (int v = 0; v < 4; ++v)
-    for (int c = 0; c < 3; ++c) N.SetF(p, names[v][c], basis[v][c]);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraNear, use_cam ? cam.near_z : 0.1f);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFar, use_cam ? cam.far_z : 1000.0f);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraFOV, use_cam ? cam.fov : 1.2f);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraAspectRatio, use_cam ? cam.aspect : float(S.w) / float(S.h));
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetX, 0.0f);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_CameraPinholeOffsetY, 0.0f);
-  // The game's MVs are in UV units; DLSS SR's own MV scale (render size) turns them into pixels.
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecScaleX, in.mvx);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecScaleY, in.mvy);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_JitterOffsetX, in.jx);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_JitterOffsetY, in.jy);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MvecInvalidValue, 1.17549435e-38f);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_BackbufferFrameID, unsigned(++S.bb_id));
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_ColorBuffersHDR, S.hdr ? 1 : 0);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthInverted, 0);  // conventional Z (re/dlss.md 3)
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_CameraMotionIncluded, 1);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_Reset, (S.reset || in.reset || (use_cam && !cam.has_prev)) ? 1 : 0);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_NotRenderingGameFrames, 0);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OrthoProjection, 0);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MvecDilated, 0);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MenuDetectionEnabled, 0);
-  N.SetF(p, NVSDK_NGX_DLSSG_Parameter_MinRelativeLinearDepthObjectSeparation, 40.0f);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectWidth, in.rw);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MVecsSubrectHeight, in.rh);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectWidth, in.rw);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_DepthSubrectHeight, in.rh);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectWidth, S.w);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_InputBackbufferSubrectHeight, S.h);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectWidth, S.w);
-  N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolatedSubrectHeight, S.h);
-  unsigned made = 0;
-  for (unsigned i = 1; i <= n_gen; ++i) {
-    to(cl, st.out[i - 1], D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameCount, n_gen);
-    N.SetUI(p, NVSDK_NGX_DLSSG_Parameter_MultiFrameIndex, i);
-    N.SetRes(p, NVSDK_NGX_DLSSG_Parameter_OutputInterpolated, st.out[i - 1].r);
-    uint32_t r = o_Eval(cl, S.feature, p, nullptr);
-    if (ngx_failed(r)) {
-      static int n = 0;
-      if (n++ < 5) TH_LOG("fg: Evaluate(index %u of %u) = 0x%08x", i, n_gen, r);
-      break;
-    }
-    made = i;
   }
   S.reset = false;
+  for (unsigned v = 0; v < nv; ++v) S.feat[fi(v)].reset = false;
+  // Stereo: the columns no view covers (a convergence shift leaves them black in the real frame) are
+  // copied from the real frame into each generated one.
+  if (nv > 1 && made) {
+    D3D12_BOX boxes[4];
+    unsigned nb = 0;
+    const unsigned half = S.w / 2;
+    for (unsigned v = 0; v < nv; ++v) {
+      const unsigned x0 = v * half, x1 = x0 + half;  // view v is half v
+      if (views[v].bx > x0) boxes[nb++] = {x0, 0, 0, views[v].bx, S.h, 1};
+      if (views[v].bx + views[v].bw < x1) boxes[nb++] = {views[v].bx + views[v].bw, 0, 0, x1, S.h, 1};
+    }
+    if (nb) {
+      to(cl, input, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      for (unsigned i = 0; i < made; ++i) {
+        to(cl, st.out[i], D3D12_RESOURCE_STATE_COPY_DEST);
+        D3D12_TEXTURE_COPY_LOCATION dl{}, sl{};
+        dl.pResource = st.out[i].r;
+        dl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        sl.pResource = input.r;
+        sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+        for (unsigned b = 0; b < nb; ++b) cl->CopyTextureRegion(&dl, boxes[b].left, 0, 0, &sl, &boxes[b]);
+      }
+      to(cl, input, kSrv);
+    }
+  }
   if (S.hdr) {  // HDR10 PQ -> scRGB, what is presented
     for (unsigned i = 0; i < made; ++i) {
       to(cl, st.out[i], kSrv);
@@ -548,10 +651,11 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
       to(cl, st.dec[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
     }
   }
-  for (unsigned i = 0; i < made; ++i) to(cl, st.out[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
+  for (unsigned i = 0; i < n_gen; ++i) to(cl, st.out[i], D3D12_RESOURCE_STATE_COPY_SOURCE);
   if (hud) {
-    // [fg] show = hudless: the HUD-less copy presented in place of the real frame (same format only).
-    if (S.show == State::kHudless && hud->r->GetDesc().Format == S.fmt) {
+    // [fg] show = hudless: the HUD-less copy presented in place of the real frame (same size and format only).
+    D3D12_RESOURCE_DESC hd = hud->r->GetDesc();
+    if (S.show == State::kHudless && hd.Format == S.fmt && hd.Width == S.w && hd.Height == S.h) {
       barrier(cl, hud->r, kSrv, D3D12_RESOURCE_STATE_COPY_SOURCE);
       to(cl, st.real, D3D12_RESOURCE_STATE_COPY_DEST);
       cl->CopyResource(st.real.r, hud->r);
@@ -562,8 +666,112 @@ unsigned evaluate(Set& st, ID3D12Resource* proxy, unsigned n_gen, const EngTex* 
   }
   to(cl, st.real, D3D12_RESOURCE_STATE_COPY_SOURCE);
   static int logged = 0;
-  if (logged++ < 3) TH_LOG("fg: evaluated %u of %u generated frames (render %ux%u)", made, n_gen, in.rw, in.rh);
+  if (logged++ < 3 || (nv > 1 && logged < 40 && S.n_views2.load() < 3))
+    TH_LOG("fg: evaluated %u of %u generated frames, %u view%s (render %ux%u; view 0 backbuffer x %u w %u, depth x %u w %u%s)",
+           made, n_gen, nv, nv > 1 ? "s" : "", st.in[views[0].eye].rw, st.in[views[0].eye].rh, views[0].bx, views[0].bw,
+           views[0].dx, views[0].dw, hl && views[0].hud ? ", HUD-less" : "");
   return made;
+}
+
+// ---- grabs (`fg grab N TAG`): the real and generated frames of N jobs, whole, as raw texels ---------
+// For checking generated frames against real ones (stereo: per eye). Copied on the job's own list after
+// DLSS-G, read back once its fence is done (renderer thread, a later Present), written as THRW .raw
+// (header "THRW", w, h, pitch, DXGI format: re/scripts/stereo_sbs.py raw / tools/fg/stereo-gen.py).
+struct Grab {
+  ID3D12Resource* rb = nullptr;
+  D3D12_PLACED_SUBRESOURCE_FOOTPRINT fp{};
+  DXGI_FORMAT fmt = DXGI_FORMAT_UNKNOWN;
+  uint64_t fence = 0;
+  std::string path;
+};
+std::vector<Grab> g_grabs;  // recorded, not yet written (renderer thread)
+std::mutex g_grab_mu;
+int g_grab_jobs = 0;  // jobs still to grab
+std::string g_grab_tag;
+std::vector<std::string> g_grab_files;
+
+void grab_record(ID3D12GraphicsCommandList* cl, ID3D12Resource* src, const std::string& path) {
+  D3D12_RESOURCE_DESC d = src->GetDesc();
+  Grab g;
+  UINT64 total = 0;
+  S.dev->GetCopyableFootprints(&d, 0, 1, 0, &g.fp, nullptr, nullptr, &total);
+  D3D12_HEAP_PROPERTIES hp{};
+  hp.Type = D3D12_HEAP_TYPE_READBACK;
+  D3D12_RESOURCE_DESC bd{};
+  bd.Dimension = D3D12_RESOURCE_DIMENSION_BUFFER;
+  bd.Width = total;
+  bd.Height = bd.DepthOrArraySize = bd.MipLevels = 1;
+  bd.SampleDesc.Count = 1;
+  bd.Layout = D3D12_TEXTURE_LAYOUT_ROW_MAJOR;
+  if (FAILED(S.dev->CreateCommittedResource(&hp, D3D12_HEAP_FLAG_NONE, &bd, D3D12_RESOURCE_STATE_COPY_DEST, nullptr,
+                                            __uuidof(ID3D12Resource), (void**)&g.rb)))
+    return;
+  D3D12_TEXTURE_COPY_LOCATION dst{}, sl{};
+  dst.pResource = g.rb;
+  dst.Type = D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT;
+  dst.PlacedFootprint = g.fp;
+  sl.pResource = src;
+  sl.Type = D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX;
+  cl->CopyTextureRegion(&dst, 0, 0, 0, &sl, nullptr);  // src is in COPY_SOURCE after evaluate()
+  g.fmt = d.Format;
+  g.path = path;
+  g_grabs.push_back(g);
+}
+
+// This job's frames (its list is still open), if a grab is armed.
+void grab_job(const Set& st, unsigned n_gen, unsigned nv) {
+  std::string tag;
+  {
+    std::lock_guard lk(g_grab_mu);
+    if (g_grab_jobs <= 0 || !n_gen) return;
+    g_grab_jobs--;
+    tag = g_grab_tag;
+  }
+  const char* d = getenv("QUIVER_LAB_RUN_DIR");
+  char base[400];
+  snprintf(base, sizeof base, "%s\\fggrab_%06u_%s", d ? d : ".", S.frame, tag.c_str());
+  ID3D12GraphicsCommandList* cl = S.rring.list[S.rring.cur];
+  grab_record(cl, st.real.r, std::string(base) + "_R.raw");
+  for (unsigned i = 0; i < n_gen; ++i) {
+    char suf[32];
+    snprintf(suf, sizeof suf, "_G%uof%u.raw", i + 1, n_gen + 1);
+    grab_record(cl, S.hdr ? st.dec[i].r : st.out[i].r, std::string(base) + suf);
+  }
+  TH_LOG("fg grab: frame %u, %u generated, %u view%s (layout: %s pack %d w %d shift %d/%d)", S.frame, n_gen, nv,
+         nv > 1 ? "s" : "", S.cur.on ? (S.cur.pair ? "pair" : "mono") : "none", S.cur.pack, S.cur.w, S.cur.shift[0],
+         S.cur.shift[1]);
+}
+
+void grab_set_fence(uint64_t v) {
+  for (Grab& g : g_grabs)
+    if (!g.fence) g.fence = v;
+}
+
+void grab_poll() {
+  for (size_t i = 0; i < g_grabs.size();) {
+    Grab& g = g_grabs[i];
+    if (!g.fence || !S.rring.done(g.fence)) {
+      ++i;
+      continue;
+    }
+    void* p = nullptr;
+    D3D12_RANGE r{0, SIZE_T(g.fp.Offset + uint64_t(g.fp.Footprint.RowPitch) * g.fp.Footprint.Height)};
+    if (SUCCEEDED(g.rb->Map(0, &r, &p))) {
+      if (FILE* f = fopen(g.path.c_str(), "wb")) {
+        uint32_t hd[5] = {0x57524854u, g.fp.Footprint.Width, g.fp.Footprint.Height, g.fp.Footprint.RowPitch, uint32_t(g.fmt)};
+        fwrite(hd, 4, 5, f);
+        fwrite(static_cast<uint8_t*>(p) + g.fp.Offset, 1, size_t(g.fp.Footprint.RowPitch) * g.fp.Footprint.Height, f);
+        fclose(f);
+        std::lock_guard lk(g_grab_mu);
+        g_grab_files.push_back(g.path);
+      }
+      D3D12_RANGE none{0, 0};
+      g.rb->Unmap(0, &none);
+    }
+    g.rb->Release();
+    g_grabs[i] = g_grabs.back();
+    g_grabs.pop_back();
+  }
 }
 
 // ---- presenting -------------------------------------------------------------------------------------
@@ -705,20 +913,21 @@ void perf() {
   if (secs < 2.0) return;
   unsigned real = S.p_real.exchange(0), gen = S.p_gen.exchange(0);
   unsigned fail = S.p_fail.exchange(0), noin = S.p_noinput.exchange(0), drop = S.p_drop.exchange(0);
-  unsigned skip = S.p_skip.exchange(0), joins = S.p_join.exchange(0);
+  unsigned skip = S.p_skip.exchange(0), joins = S.p_join.exchange(0), views2 = S.p_views2.exchange(0);
   int64_t lag_n = S.lag_n.exchange(0), lag_sum = S.lag_sum.exchange(0), join_sum = S.join_sum.exchange(0);
   double lag_ms = lag_n ? lag_sum / 1000.0 / lag_n : 0;
   TH_LOG("perf: fg real %.1f + generated %.1f = %.1f presents/s (x%.2f, count %u%s, cap %.1f, interval %.2f ms; DLSS-G done %.2f ms "
-         "after the game's Present; game waited %u x %.2f ms; fail %u, no input %u, dropped %u, skipped %u)",
+         "after the game's Present; game waited %u x %.2f ms; fail %u, no input %u, dropped %u, skipped %u%s)",
          real / secs, gen / secs, (real + gen) / secs, real ? 1.0 + double(gen) / real : 0.0, count_now(),
-         S.count_auto ? " auto" : "", S.cap_now, S.interval_us / 1000.0, lag_ms, joins, joins ? join_sum / 1000.0 / joins : 0.0, fail, noin, drop, skip);
+         S.count_auto ? " auto" : "", S.cap_now, S.interval_us / 1000.0, lag_ms, joins, joins ? join_sum / 1000.0 / joins : 0.0, fail, noin, drop, skip,
+         S.link.eye ? (std::string("; per eye ") + std::to_string(views2) + " frames").c_str() : "");
   char buf[512];
   snprintf(buf, sizeof buf,
            "{\"real_fps\":%.2f,\"presents_per_s\":%.2f,\"multiplier\":%.3f,\"count\":%u,\"auto\":%s,\"cap\":%.2f,\"interval_ms\":%.3f,"
-           "\"lag_ms\":%.3f,\"joins\":%u,\"fail\":%u,\"no_input\":%u,\"dropped\":%u,\"skipped\":%u}",
+           "\"lag_ms\":%.3f,\"joins\":%u,\"fail\":%u,\"no_input\":%u,\"dropped\":%u,\"skipped\":%u,\"per_eye_frames\":%u}",
            real / secs, (real + gen) / secs, real ? 1.0 + double(gen) / real : 0.0, count_now(),
            S.count_auto ? "true" : "false", S.cap_now, S.interval_us / 1000.0,
-           lag_ms, joins, fail, noin, drop, skip);
+           lag_ms, joins, fail, noin, drop, skip, views2);
   {
     std::lock_guard lk(S.perf_mu);
     S.perf_json = buf;
@@ -881,11 +1090,61 @@ void auto_step(int64_t now) {
   S.auto_count = m;
 }
 
+// This frame's views (0 = no inputs): the whole frame, or with a side-by-side stereo layout reported
+// by stereo's `end` one view per eye, each in its half of the frame (docs/fg.md "Stereo").
+//  pack 1: the frame is 2W, each eye 1:1; pack 2: W, each eye squeezed into W/2.
+//  An eye image shifted by s (convergence) shows eye columns [max(-s, 0), W - max(s, 0)) at
+//  half x + max(s, 0): the view covers that, with depth/MVs and the camera cropped to the same columns.
+//  A frame without a pair (one render duplicated into both halves) gives both views the one input set.
+unsigned frame_views(const Set& st, const EngTex* hud, View* out) {
+  const unsigned hw = hud ? unsigned(hud->r->GetDesc().Width) : 0;
+  const bool stereo = S.cur.on && S.cur.w > 0 && (S.cur.pack == 1 ? S.w == 2u * unsigned(S.cur.w) : S.cur.pack == 2 && S.w == unsigned(S.cur.w));
+  if (!stereo) {
+    if (!st.in[0].ok) return 0;
+    View& v = out[0];
+    v.bx = 0, v.bw = S.w;
+    v.hud = hud != nullptr, v.hx = 0, v.hw = std::min(hw, S.w);
+    v.dx = 0, v.dw = st.in[0].rw;
+    v.eye = 0, v.fw = S.w;
+    return 1;
+  }
+  const bool pair = S.cur.pair;
+  if (!st.in[0].ok || (pair && !st.in[1].ok)) return 0;
+  const int W = S.cur.w;
+  const unsigned half = S.w / 2;  // the output width of one eye
+  for (unsigned e = 0; e < 2; ++e) {
+    View& v = out[e];
+    const Inputs& in = st.in[pair ? e : 0];
+    const int s = pair ? std::max(-(W - 1), std::min(W - 1, S.cur.shift[e])) : 0;
+    const int p0 = std::max(-s, 0), wc = W - std::abs(s);
+    const unsigned x0 = S.cur.pack == 1 ? unsigned(std::max(s, 0)) : unsigned(std::max(s, 0)) / 2;
+    v.bx = e * half + x0;
+    v.bw = S.cur.pack == 1 ? unsigned(wc) : std::min(half - x0, unsigned(wc + 1) / 2);
+    v.dx = unsigned(int64_t(p0) * in.rw / W);
+    v.dw = std::min(in.rw - v.dx, unsigned((int64_t(wc) * in.rw + W / 2) / W));
+    v.crop_p0 = p0, v.crop_wc = wc, v.crop_w = W;
+    v.eye = pair ? e : 0;
+    // DLSS-G rejects a backbuffer sub-rectangle narrower than the feature (0xBAD00005, live r2): the
+    // feature is made at the shown width, so a convergence change re-creates it.
+    v.fw = v.bw;
+    // HUD-less: the side-by-side texture before the HUD (same layout as the frame), or for a frame
+    // without a pair the one eye-wide colour target; none when the frame is squeezed (pack 2).
+    v.hud = false;
+    if (hud && S.cur.pack == 1 && hw == S.w) v.hud = true, v.hx = v.bx, v.hw = v.bw;
+    else if (hud && S.cur.pack == 1 && !pair && hw == half) v.hud = true, v.hx = v.bx - e * half, v.hw = v.bw;
+  }
+  if (!pair) S.n_views2_mono++;
+  return 2;
+}
+
 // The game's Present (renderer thread).
 bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   if (!S.enabled || !S.sc || sc != (IDXGISwapChain*)S.sc || !S.proxy[0].r) return false;
+  S.cur = S.lay;  // stereo reports each frame it composes; a frame it doesn't is the whole frame
+  S.lay.on = false;
   if (!real_buffers()) return false;
   detect_refresh();
+  if (!g_grabs.empty()) grab_poll();
   reflex_present_begin(S.dev);
   // Which proxy did the engine just render? Its own index flips after Present (re/dlss.md 2.2).
   void* nt = g_auto_bb();
@@ -935,7 +1194,6 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   unsigned want = std::min(std::max(count_now(), 1u), S.caps_max_gen + 1) - 1;
   if (!S.on) want = 0;
   unsigned n_gen = 0;
-  if (want && !st.in.ok) ++S.p_noinput;
   EngTex hud;
   bool have_hud = hudless_take(hud) && hud.tracked && S.hudless.load();
   // In HDR the HUD-less colour must be scRGB like the swapchain to be encoded like the real frame.
@@ -944,15 +1202,28 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
     if (n++ < 1) TH_LOG("fg: HDR: HUD-less colour is DXGI %d, not the swapchain's %d: not used", int(hud.r->GetDesc().Format), int(S.fmt));
     have_hud = false;
   }
-  if (want && st.in.ok && ensure_ngx() && ensure_feature(st.in.rw, st.in.rh) && ensure_outputs(st, want)) {
-    n_gen = evaluate(st, proxy, want, have_hud ? &hud : nullptr);
+  View views[2];
+  const unsigned nv = frame_views(st, have_hud ? &hud : nullptr, views);
+  const bool have_in = nv > 0;
+  if (want && !have_in) ++S.p_noinput;
+  bool feats = have_in && ensure_ngx();
+  const unsigned nf = nv > 1 && S.stereo_shared.load() ? 1 : nv;  // dev: one feature for both eyes
+  for (unsigned v = 0; feats && v < nf; ++v)
+    feats = ensure_feature(v, views[v].fw, st.in[views[v].eye].rw, st.in[views[v].eye].rh);
+  if (want && feats && ensure_outputs(st, want)) {
+    n_gen = evaluate(st, proxy, want, have_hud ? &hud : nullptr, views, nv);
     if (n_gen < want) ++S.p_fail;
+    if (nv > 1 && n_gen) {
+      S.p_views2++;
+      S.n_views2++;
+    }
   } else {
     ensure_outputs(st, 0);
-    evaluate(st, proxy, 0, nullptr);
+    evaluate(st, proxy, 0, nullptr, views, 0);
   }
-  if (!st.in.ok) S.reset = true;
-  st.in.ok = false;
+  if (nf == 1 && S.feat[1].h) release_feature(1);  // one view again (stereo off): the right eye's goes
+  if (!have_in) S.reset = true;
+  st.in[0].ok = st.in[1].ok = false;
   if (!n_gen && S.chain) S.interval_us = 16667;
   if (!n_gen) S.interval_us = std::min<int64_t>(S.interval_us, 33333);
   S.chain = n_gen > 0;
@@ -963,8 +1234,10 @@ bool takeover(IDXGISwapChain* sc, unsigned sync, unsigned flags) {
   j.pace = S.pace.load();
   j.relax = S.relax.load();
   lat_end(S.rring.list[S.rring.cur], S.frame, n_gen, t);
+  grab_job(st, n_gen, nv);
   j.frame = S.frame;
   j.eval_v = S.rring.submit(S.q);
+  grab_set_fence(j.eval_v);
   j.sync = sync;
   j.flags = flags;
   j.arrive_us = t;
@@ -1025,13 +1298,15 @@ bool getbuffer(IDXGISwapChain* sc, unsigned i, REFIID riid, void** out, long* hr
   if (hdr != S.hdr) TH_LOG("fg: swapchain %s: DLSS-G input %s", hdr ? "FP16 scRGB (HDR)" : "SDR",
                            hdr ? "HDR10 PQ (converted)" : "as presented");
   S.hdr = hdr;
-  if (!S.proxy[i].r || S.w != d.BufferDesc.Width || S.h != d.BufferDesc.Height || S.fmt != d.BufferDesc.Format) {
-    ID3D12Resource* real = nullptr;
-    if (FAILED(present_real_buffer(sc, i, __uuidof(ID3D12Resource), (void**)&real))) return false;
-    D3D12_RESOURCE_DESC rd = real->GetDesc();
-    real->Release();
-    S.w = d.BufferDesc.Width;
-    S.h = d.BufferDesc.Height;
+  // The real buffer's size: GetDesc reports what the game asked for, which a stereo side-by-side
+  // swapchain (core/present.cpp width scale) doubles.
+  ID3D12Resource* real = nullptr;
+  if (FAILED(present_real_buffer(sc, i, __uuidof(ID3D12Resource), (void**)&real))) return false;
+  D3D12_RESOURCE_DESC rd = real->GetDesc();
+  real->Release();
+  if (!S.proxy[i].r || S.w != rd.Width || S.h != rd.Height || S.fmt != d.BufferDesc.Format) {
+    S.w = unsigned(rd.Width);
+    S.h = rd.Height;
     S.fmt = d.BufferDesc.Format;
     if (!make_tex(S.dev, S.proxy[i], rd, D3D12_RESOURCE_STATE_PRESENT, i ? L"threshold proxy 1" : L"threshold proxy 0")) return false;
     TH_LOG("fg: proxy back buffer %u: %ux%u fmt %d flags 0x%x", i, S.w, S.h, int(S.fmt), int(rd.Flags));
@@ -1054,7 +1329,7 @@ void before_resize(IDXGISwapChain* sc) {
     safe_release(st.hud_enc.r);
     for (Tex& o : st.out) safe_release(o.r);
     for (Tex& o : st.dec) safe_release(o.r);
-    st.in.ok = false;
+    st.in[0].ok = st.in[1].ok = false;
   }
   S.reset = true;
   TH_LOG("fg: resize: released proxies and generated-frame textures");
@@ -1121,6 +1396,7 @@ void fg_register() {
     else if (id == "fg.pace") S.pace = v == "smooth" ? 1 : 0;
     else if (id == "fg.pace_relax") S.relax = std::max(0.0, std::min(1.0, atof(v.c_str())));
     else if (id == "fg.hudless") S.hudless = v != "0" && v != "false" && v != "off";
+    else if (id == "fg.stereo_features") S.stereo_shared = v == "1";
   });
   lab_verb("fg", [](const std::vector<std::string>& a, bool& ok) -> std::string {
     std::string sub = a.empty() ? "status" : a[0];
@@ -1131,7 +1407,11 @@ void fg_register() {
         perf = S.perf_json;
       }
       return "{\"enabled\":" + std::string(S.enabled ? "true" : "false") + ",\"feature\":" +
-             std::string(S.feature ? "true" : "false") + ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
+             std::string(S.feat[0].h ? "true" : "false") + ",\"feature_right\":" + std::string(S.feat[1].h ? "true" : "false") +
+             ",\"stereo_link\":" + std::string(S.link.eye ? "true" : "false") + ",\"frames_per_eye\":" +
+             std::to_string(S.n_views2.load()) + ",\"frames_per_eye_mono\":" + std::to_string(S.n_views2_mono.load()) +
+             ",\"size\":\"" + std::to_string(S.w) + "x" + std::to_string(S.h) + "\"" +
+             ",\"max_count\":" + std::to_string(S.caps_max_gen + 1) +
              ",\"perf\":" + perf + ",\"trace\":" + trace_status_json() + ",\"reflex\":" + reflex_status_json() + "}";
     }
     if (sub == "latency") {
@@ -1147,9 +1427,40 @@ void fg_register() {
       int y = a.size() > 3 ? atoi(a[3].c_str()) : -1, h = a.size() > 4 ? atoi(a[4].c_str()) : 0;
       return json_str(trace_arm(n, shots, y, h));
     }
+    if (sub == "grab") {  // grab JOBS TAG: the next JOBS jobs with generated frames, written as .raw
+      std::lock_guard lk(g_grab_mu);
+      if (a.size() > 1 && a[1] == "files") {
+        std::string r = "[";
+        for (size_t i = 0; i < g_grab_files.size(); i++) r += (i ? "," : "") + json_str(g_grab_files[i]);
+        return r + "]";
+      }
+      g_grab_jobs = a.size() > 1 ? std::max(1, std::min(8, atoi(a[1].c_str()))) : 1;
+      g_grab_tag = a.size() > 2 ? a[2] : "grab";
+      g_grab_files.clear();
+      return json_str("grabbing the next " + std::to_string(g_grab_jobs) + " jobs (fg grab files)");
+    }
     ok = false;
-    return json_str("usage: fg [status|trace [presents] [shots] [band y] [band h]]");
+    return json_str("usage: fg [status|trace [presents] [shots] [band y] [band h]|grab [jobs] [tag]|grab files]");
   });
+}
+
+bool fg_enabled() { return S.enabled; }
+
+void fg_stereo_link(const FgStereoLink& link) {
+  if (!S.enabled) return;
+  S.link = link;
+  hudless_defer(link.hud_pending);
+  TH_LOG("fg: stereo linked: one input set and DLSS-G feature per eye in side-by-side frames");
+}
+
+void fg_stereo_hudless(void* renderer, void* sbs_nt) {
+  if (S.enabled) hudless_copy_from(renderer, sbs_nt);
+}
+
+void fg_stereo_frame(int pack, int w, int shift_left, int shift_right, bool pair) {
+  if (!S.enabled) return;
+  S.lay.on = true;
+  S.lay.pack = pack, S.lay.w = w, S.lay.shift[0] = shift_left, S.lay.shift[1] = shift_right, S.lay.pair = pair;
 }
 
 void fg_start() {
