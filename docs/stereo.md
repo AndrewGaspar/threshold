@@ -747,8 +747,8 @@ waits never satisfied as `STUCK`.
 ### Resume notes: stereo + frame generation (2026-11-23, branch `wip/stereo-fg`)
 
 - **State.** Implemented and measured (section "Stereo with frame generation"). Lab instance
-  `control-sfg` on rayblaster (display 3840x1080@120, left with `display.hdr=on` and renderer.ini
-  `m_eAllowHDR 0`, SDR display, RT off, DLSS Quality 1280x720 → 1920x1080) is down. Its first launch writes renderer.ini;
+  `control-sfg` on rayblaster (display 3840x1080@120, SDR: `display.hdr=off`, renderer.ini
+  `m_eAllowHDR 0`, RT off, DLSS Quality 1280x720 → 1920x1080) is down. Its first launch writes renderer.ini;
   edit it in `~/Games/quiver-lab/instances/control-sfg/install/` while the game isn't running.
 - **Drive.** `tools/lab/moddir OUT fg.enabled=1 stereo.mode=sbs stereo.output=full fg.count=2`, then
   `Q="quiver --machine rayblaster" tools/fg/launch control-sfg OUT` (into the lobby, cinematics
