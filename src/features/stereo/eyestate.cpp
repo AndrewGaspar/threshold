@@ -252,7 +252,7 @@ using Prepare_t = void(__fastcall*)(void*);
 struct RightSet {
   uint8_t graph[16]{};  // the persisted-resource vector header
   int graph_w = 0, graph_h = 0;
-  void* dlf[4]{};
+  void* dlf[kDlfHistories]{};
   void* ssao_obj = nullptr;
   void* ssao[6]{};
   void* vol_obj = nullptr;
@@ -265,8 +265,10 @@ struct RightSet {
 RightSet g_rs, g_ls;  // the right eye's set; the engine's (left) values while the right one is in
 bool g_rs_in = false;
 std::atomic<int> g_hist_per_eye{1};  // stereo.history_per_eye (part of per_eye; a separate control)
-// stereo.history_mask (debug): 1 graph persisted, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring
-std::atomic<int> g_hist_mask{30};  // graph list (1) shared by default: docs/stereo.md, "Render-graph history"
+// stereo.history_mask (debug): 1 graph persisted, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring,
+// 32 the RT reflection filter's output history (with 2). All per eye by default: measured best
+// (docs/stereo.md, "Render-graph history", rayblaster r38).
+std::atomic<int> g_hist_mask{63};
 int g_mask_now = 0;  // the mask the current swap used (leave undoes exactly that)
 std::atomic<uint64_t> g_n_hist_swaps{0}, g_n_graph_flush{0};
 void* rt_manager() { return *reinterpret_cast<void**>(g_rimg.at(kRvaRtManager)); }
@@ -348,14 +350,26 @@ void hist_enter(void* r) {
     graph_flush(g_rs);
     g_rs.graph_w = rw, g_rs.graph_h = rh;
   }
-  int m = g_mask_now = g_hist_mask.load();
+  int m = g_hist_mask.load();
+  // The RT reflection filter (renderer+0x15bd0) treats its two histories as one: a non-null input
+  // history (0x912b18) means "both exist" (it then uses the output history 0x912b20 unchecked; a null
+  // one crashed, live r32), a null one makes it allocate both and free the current output history. So
+  // bit 32 only with bit 2, and when the right eye's output history is new, its input history starts
+  // over too.
+  if (!(m & 2)) m &= ~32;
+  if ((m & 32) && !g_rs.dlf[4] && g_rs.dlf[1]) {
+    g_free_tex(rt_manager(), g_rs.dlf[1]);
+    g_rs.dlf[1] = nullptr;
+  }
+  g_mask_now = m;
   uint8_t* gp = reinterpret_cast<uint8_t*>(g_rimg.at(kRvaGraphPrev));
   if (m & 1) {
     graph_cross(gp, g_rs.graph);  // debug: the left eye's latest into the right list
     memcpy(g_ls.graph, gp, 16);
     memcpy(gp, g_rs.graph, 16);
   }
-  for (int i = 0; i < 4 && (m & 2); i++) {
+  for (size_t i = 0; i < kDlfHistories; i++) {
+    if (!(m & (i < 4 ? 2 : 32))) continue;
     void*& g = *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i]));
     g_ls.dlf[i] = g;
     g = g_rs.dlf[i];
@@ -404,7 +418,8 @@ void hist_leave(void* r) {
     memcpy(g_rs.graph, gp, 16);
     memcpy(gp, g_ls.graph, 16);
   }
-  for (int i = 0; i < 4 && (m & 2); i++) {
+  for (size_t i = 0; i < kDlfHistories; i++) {
+    if (!(m & (i < 4 ? 2 : 32))) continue;
     void*& g = *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i]));
     g_rs.dlf[i] = g;
     g = g_ls.dlf[i];
@@ -475,7 +490,7 @@ void eyestate_register() {
     g_hist_per_eye = (v == "0" || v == "false" || v == "off") ? 0 : 1;
   });
   cfg_listen("stereo.history_mask", [](const std::string&, const std::string& v) {
-    g_hist_mask = v.empty() ? 30 : atoi(v.c_str());
+    g_hist_mask = v.empty() ? 63 : atoi(v.c_str());
   });
   cfg_listen("stereo.graph_cross", [](const std::string&, const std::string& v) { g_graph_cross = atoi(v.c_str()); });
   cfg_listen("stereo.dlss_per_eye", [](const std::string&, const std::string& v) {
@@ -599,7 +614,7 @@ void* eyestate_texture(const std::string& kind, int i) {
     if (*reinterpret_cast<int*>(e + kGraphEntryType) != 0) return nullptr;
     return gpu_native(*reinterpret_cast<void**>(e + kGraphEntryRes));
   }
-  if ((kind == "dlfL" || kind == "dlfR") && i < 4) {
+  if ((kind == "dlfL" || kind == "dlfR") && size_t(i) < kDlfHistories) {
     void* t = kind == "dlfL" ? *reinterpret_cast<void**>(g_rimg.at(kRvaDlfHistory[i])) : g_rs.dlf[i];
     return t ? gpu_native(t) : nullptr;
   }

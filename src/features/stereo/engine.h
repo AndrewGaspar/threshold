@@ -133,7 +133,11 @@ constexpr uintptr_t kRvaGraphPrev = 0x910c20;
 constexpr size_t kGraphEntry = 0xa0, kGraphEntryType = 0x88, kGraphEntryRes = 0x90;
 // T5 RT denoiser (DeferredLightFiltering) histories: Texture2D* globals, allocated when null and
 // re-created on a size change by their filters (0x14c90, 0x15bd0, 0x17050).
-constexpr uintptr_t kRvaDlfHistory[4] = {0x90eac8, 0x912b18, 0x910b98, 0x90eb98};
+// The RT reflection filter (filterSpecularNoise 0x15bd0) keeps two: 0x912b18 (the temporal pass's
+// history) and 0x912b20 (its output history, written after the spatial passes, read by the next
+// render; allocated and freed together with 0x912b18: static). history_mask bit 32 swaps 0x912b20.
+constexpr size_t kDlfHistories = 5;
+constexpr uintptr_t kRvaDlfHistory[kDlfHistories] = {0x90eac8, 0x912b18, 0x910b98, 0x90eb98, 0x912b20};
 // T4 rend::SSAO (r+0xd8) ping-pong pairs indexed by counter & 1 (SSR / AO / sun shadow temporal),
 // allocated when null by its prepare (slot 1).
 constexpr size_t kSsaoPairs[6] = {0x100, 0x108, 0x118, 0x120, 0x130, 0x138};
