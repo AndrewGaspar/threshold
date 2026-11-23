@@ -4,7 +4,7 @@ version = "0.1.0"
 kind = "mod"
 description = "Stereoscopic 3D, DLSS Multi Frame Generation and current DLSS models for Control."
 save_compatible = true
-games = ["gog:2049187585"]
+games = ["gog:2049187585", "steam:870780"]  # identical engine DLLs; the Steam exe differs only in store URLs
 
 # The mod is a dxgi.dll proxy in the game folder (it forwards to the system dxgi).
 [launch]
