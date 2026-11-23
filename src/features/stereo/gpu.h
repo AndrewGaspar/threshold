@@ -3,6 +3,7 @@
 #include <string>
 
 struct IDXGISwapChain;
+struct ID3D12GraphicsCommandList;
 
 namespace th::stereo {
 
@@ -47,6 +48,31 @@ std::string gpu_status();
 bool gpu_dup_install();
 void gpu_dup_arm(int dx);  // 0 disarms
 uint64_t gpu_dup_count();
+
+// Per-draw hook for the UI layer (ui.cpp): called on the armed thread for every draw while the
+// duplication is armed, or while observing (gpu_draw_observe, no duplication). Phase 0 before the
+// original draw: `shift` (pixels, per eye: [0] the original draw, [1] the duplicate) may be set; a
+// shifted draw has its viewport moved and its scissor kept inside its eye's half. Phase 1 right
+// before the duplicate, phase 2 right after it (both only while duplicating). `cl` is the
+// engine's command list the draw is recorded on.
+struct DupDraw {
+  unsigned count = 0, start = 0;  // indices (or vertices)
+  int base = 0;
+  float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0;  // the viewport as the engine set it
+  int dx = 0;                                    // the duplicate's offset (0: observing only)
+  float shift[2] = {0, 0};
+};
+using DupCb = void (*)(ID3D12GraphicsCommandList* cl, int phase, DupDraw& d);
+void gpu_dup_callback(DupCb cb);
+void gpu_draw_observe(bool on);  // this thread's draws reach the callback without duplication
+// A copy recorded on `cl` (an engine list, mid-pass) from one engine texture into another of the
+// same size, with barriers from and back to each one's tracked state.
+bool gpu_copy_on(ID3D12GraphicsCommandList* cl, void* src_nt, void* dst_nt);
+// Texel probes: one texel of an engine texture copied on `cl` into readback slot (ring, slot), read
+// on the CPU a few frames later (ring of kProbeRing frames). R16_FLOAT / R32_FLOAT / D32 formats.
+constexpr int kProbeSlots = 64, kProbeRing = 4;
+bool gpu_probe(ID3D12GraphicsCommandList* cl, void* nt, int ring, int slot, int x, int y);
+bool gpu_probe_value(int ring, int slot, float* v);  // the slot's last copied value (as float)
 
 // The engine texture's size and tracked state, for logs ("1920x1080 state 0x4 res 0x...").
 std::string gpu_describe(void* nt);
