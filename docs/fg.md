@@ -4,7 +4,8 @@
 > `count = auto` (opt-in) and HDR frame generation are verified live on rayblaster (behaviour and HDR
 > captures). Latency measured (section 8): FG adds ~3 ms (2x) / ~4 ms (4x) to the first present at
 > ~200 rendered fps. The headroom cap (`auto_cap`, 7) and injected Reflex (`reflex`, 9) work but cost
-> or gain nothing measurable here, so both default off. Resume notes at the end.
+> or gain nothing measurable here, so both default off. Stereo 3D with FG works per eye (section 10).
+> Resume notes at the end.
 
 Control has no frame generation. Threshold adds it through NGX directly (no Streamline), on the
 game's own D3D12 device, queue and NGX instance. Code: `src/features/fg/`: `fg.cpp` (inputs,
@@ -369,6 +370,33 @@ Still no effect (sleep 0.3 ms per frame). The likely reason, besides the fast GP
 present", default on; static, re/dlss.md 2.3), so there is no render queue for Reflex to drain. Reflex
 therefore stays **off by default**; it is there for slower GPUs, where it is still to be measured.
 
+### 10. Stereo (side-by-side 3D, `[stereo] mode = sbs`)
+
+With stereo's packed output (`full`/`sbs`: a 2W swapchain) the frame FG gets is both eyes side by
+side, rendered from one update (docs/stereo.md). FG then works per eye (docs/stereo.md "Stereo with
+frame generation" has the measurements):
+
+- `fg_stereo_link` (stereo, at start, only with a packed output): `eye()` tells the Eval tap whether
+  the DLSS evaluation belongs to the left (0) or right (1) eye's render, or neither (−1). The tap
+  keeps `Set::in[2]`, `depth[2]`, `mv[2]`, one per eye (camera read in that eye's render).
+- `fg_stereo_frame` (stereo's `end`): the frame's layout. `frame_views` makes one `View` per eye:
+  backbuffer/output/HUD-less sub-rectangle (the eye's half), depth/MV sub-rectangle, camera crop.
+- `evaluate` runs per generated index and view, with feature `feat[v]` (one per eye, made at one
+  eye's size: DLSS-G refuses a sub-rectangle narrower than its feature, `0xBAD00005`) and
+  `DLSSG.EvalFlags = UpdateOnlyInsideExtents` so neither eye overwrites the other's half. Columns no
+  view covers (an image-shift convergence) are copied from the real frame.
+- HUD-less: `fg_stereo_hudless` (stereo's renderHUD, both eyes composed, before the HUD); FG's own
+  renderHUD tap defers to it (`hudless_defer`). The HUD-less texture cache holds two sizes (the
+  eye-wide colour target and the 2W side-by-side texture) so pair and mono frames don't reallocate.
+- `GetBuffer`: the proxies and FG's size come from the real buffer (2W); the swapchain's `GetDesc`
+  reports the game's own width under stereo's width scale.
+- `fg status`: `feature_right`, `stereo_link`, `frames_per_eye`, `size`; the perf line adds `per eye
+  N frames`.
+- Dev `[fg] stereo_features = 1`: one feature (the left eye's) for both eyes, the negative control
+  (wrong by design: the right eye interpolates from the left eye's previous image).
+- `fg grab N TAG` / `fg grab files`: the real and generated frames of the next N jobs, whole, as
+  THRW `.raw` in the run folder (`tools/fg/stereo-grab`, `tools/fg/stereo-gen.py`).
+
 ## Options (`[fg]`)
 
 | key | default | |
@@ -387,6 +415,7 @@ therefore stays **off by default**; it is there for slower GPUs, where it is sti
 | `pace_relax` | 0.5 | `smooth`: how much of an early DLSS-G finish the first generated frame may use; live |
 | `show` | all | `generated` / `real` / `hudless` (the HUD-less copy instead of real frames, generated frames off) for debugging and captures |
 | `buffers` | 3 | real swapchain buffers while enabled |
+| dev: `stereo_features` | 2 | with stereo: `1` = one DLSS-G feature for both eyes (the negative control of section 10; wrong by design); live |
 
 Needs the game's DLSS on (any quality including DLAA). HDR (FP16 scRGB swapchain) works through the PQ conversion (6).
 Menus, loading screens and the game's pre-rendered video cutscenes don't run DLSS, so they have no
@@ -414,8 +443,15 @@ installed with `enabled = 1`.
   way).
 - HDR: the trace can't decode FP16 bands; HUD-less in HDR assumes `copyWithGamma` is the identity for
   scRGB as well (measured equal outside the HUD, 6).
-- Stereo + FG: not combined (stereo stays off with `[fg] enabled`). The HUD-less vtable patch chains
-  into stereo's detour if both ever run.
+- Stereo + FG (section 10; measurements in docs/stereo.md "Stereo with frame generation", 2x/4x, SDR
+  and HDR, hsbs smoke-tested): not tested with RT on, across level changes, or for latency.
+
+## Resume notes: stereo (2026-11-23, branch `wip/stereo-fg`)
+
+Section 10 is implemented and measured (docs/stereo.md has the numbers and its own resume notes).
+FG-only behaviour is unchanged: without a packed stereo output stereo doesn't link and FG evaluates
+the whole frame with one feature (live r7). `GetBuffer` now takes FG's size from the real buffer
+(identical without stereo's width scale).
 
 ## Resume notes (2026-11-23, branch `wip/fg-latency-reflex`)
 
