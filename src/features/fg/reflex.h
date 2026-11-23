@@ -17,6 +17,7 @@ void reflex_config(int mode, bool markers);
 void reflex_present_begin(ID3D12Device* dev);
 void reflex_present_end(ID3D12Device* dev);
 std::string reflex_status_json();
+int reflex_applied();  // the sleep mode in force: 0 off, 1 on, 2 boost
 uint64_t reflex_wait_us();  // total time slept in NvAPI_D3D_Sleep
 
 }  // namespace th::fg

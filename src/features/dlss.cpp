@@ -4,12 +4,15 @@
 
 #include <atomic>
 #include <cstdint>
+#include <mutex>
+#include <set>
 #include <string>
 
 #include "core/config.h"
 #include "core/hook.h"
 #include "core/log.h"
 #include "core/module.h"
+#include "core/quiver.h"
 
 namespace th {
 namespace {
@@ -25,6 +28,10 @@ using CreateFeature_t = uint32_t(__cdecl*)(void* cmdList, int feature, void* par
 CreateFeature_t o_CreateFeature;
 using GetUI_t = uint32_t(__cdecl*)(void* params, const char* name, unsigned* value);
 GetUI_t g_GetUI;  // NVSDK_NGX_Parameter_GetUI, exported by the game's d3d DLL
+using GetI_t = uint32_t(__cdecl*)(void* params, const char* name, int* value);
+GetI_t g_GetI;  // NVSDK_NGX_Parameter_GetI
+using ReleaseFeature_t = uint32_t(__cdecl*)(void* handle);
+ReleaseFeature_t o_ReleaseFeature;
 
 // "a.b.c.d" of a loaded module's file version, or "" if it isn't loaded.
 std::string module_version(const wchar_t* name) {
@@ -62,6 +69,44 @@ std::string preset_hints(void* params, int feature) {
   return out;
 }
 
+// HUD metrics (Quiver's Sight): the upscaler and the render size, from the game's latest Super
+// Resolution feature creation; "off" once it has released every SR feature (DLSS off in its menu).
+::quiver_metric g_m_upscaler = QUIVER_NO_METRIC, g_m_res = QUIVER_NO_METRIC;
+std::mutex g_sr_mu;
+std::set<void*> g_sr;  // live SR feature handles (stereo's per-eye DLSS makes two)
+
+unsigned get_ui(void* params, const char* name) {
+  unsigned v = 0;
+  return g_GetUI && params && g_GetUI(params, name, &v) == 1 ? v : 0;
+}
+
+// NVSDK_NGX_PerfQuality_Value (nvsdk_ngx_defs.h): MaxPerf, Balanced, MaxQuality, UltraPerformance,
+// UltraQuality, DLAA; the hint key's mode name and the label shown.
+struct Mode {
+  const char* hint;
+  const char* label;
+};
+constexpr Mode kModes[] = {{"Performance", "Performance"}, {"Balanced", "Balanced"}, {"Quality", "Quality"},
+                           {"UltraPerformance", "Ultra Perf"}, {"UltraQuality", "Ultra Quality"}, {"DLAA", "DLAA"}};
+
+void report_sr(void* params) {
+  int q = -1;
+  if (!g_GetI || !params || g_GetI(params, "PerfQualityValue", &q) != 1) q = -1;
+  std::string text = "DLSS";
+  if (q >= 0 && q < int(std::size(kModes))) {
+    text += std::string(" ") + kModes[q].label;
+    unsigned p = get_ui(params, (std::string("DLSS.Hint.Render.Preset.") + kModes[q].hint).c_str());
+    if (p) text += std::string(" ") + char('A' + p - 1);
+  }
+  const unsigned w = get_ui(params, "Width"), h = get_ui(params, "Height");
+  const unsigned ow = get_ui(params, "OutWidth"), oh = get_ui(params, "OutHeight");
+  char res[48];
+  snprintf(res, sizeof res, "%u\u00d7%u", w, h);
+  ::quiver_text(quiver_sdk(), g_m_upscaler, text.c_str());
+  if (w && h) ::quiver_text(quiver_sdk(), g_m_res, res);
+  TH_LOG("dlss: HUD: upscaler \"%s\", render %ux%u -> %ux%u", text.c_str(), w, h, ow, oh);
+}
+
 std::atomic<bool> g_rr{false};
 std::atomic<unsigned> g_rr_refused{0};
 
@@ -85,12 +130,33 @@ uint32_t __cdecl hk_CreateFeature(void* cmdList, int feature, void* params, void
   uint32_t r = o_CreateFeature(cmdList, feature, params, handle);
   TH_LOG("dlss: CreateFeature(%s=%d) = 0x%08x handle %p; preset hints (DLAA UQ Q B P UP): %s", feature_name(feature),
          feature, r, handle ? *handle : nullptr, hints.c_str());
+  if (feature == kFeatureSuperSampling && r == 1 && handle && *handle) {
+    {
+      std::lock_guard lk(g_sr_mu);
+      g_sr.insert(*handle);
+    }
+    report_sr(params);
+  }
   static bool once = false;
   if (!once && feature == kFeatureSuperSampling) {
     once = true;
     TH_LOG("dlss: nvngx_dlss.dll %s", module_version(L"nvngx_dlss.dll").c_str());
   }
   return r;
+}
+
+uint32_t __cdecl hk_ReleaseFeature(void* handle) {
+  bool last = false;
+  {
+    std::lock_guard lk(g_sr_mu);
+    last = g_sr.erase(handle) && g_sr.empty();
+  }
+  if (last) {
+    ::quiver_text(quiver_sdk(), g_m_upscaler, "off");
+    ::quiver_text(quiver_sdk(), g_m_res, "native");
+    TH_LOG("dlss: HUD: the last Super Resolution feature was released: upscaler \"off\"");
+  }
+  return o_ReleaseFeature(handle);
 }
 
 }  // namespace
@@ -110,7 +176,21 @@ void dlss_start() {
     return;
   }
   g_GetUI = (GetUI_t)module_export(kD3D, "NVSDK_NGX_Parameter_GetUI", "dlss");
+  g_GetI = (GetI_t)module_export(kD3D, "NVSDK_NGX_Parameter_GetI", "dlss");
   hook_fn(p, (void*)hk_CreateFeature, (void**)&o_CreateFeature, "NVSDK_NGX_D3D12_CreateFeature");
+  // The upscaler for Sight's HUD (docs/dlss.md "HUD metrics"), set at feature creation and release.
+  g_m_upscaler = metric_declare("upscaler", QUIVER_TEXT,
+      "\"label\":\"Upscaler\",\"short\":\"SR\",\"help\":\"The game's DLSS Super Resolution: its quality mode and the "
+      "preset the game asks for (a driver override can replace it), or off.\",\"group\":\"Upscaling\",\"order\":10,"
+      "\"level\":\"basic\"");
+  g_m_res = metric_declare("res.internal", QUIVER_TEXT,
+      "\"label\":\"Internal resolution\",\"help\":\"The size the game renders at before DLSS upscales it (one eye's in "
+      "stereo 3D).\",\"group\":\"Upscaling\",\"order\":11,\"level\":\"basic\"");
+  void* rel = module_export(kD3D, "NVSDK_NGX_D3D12_ReleaseFeature", "dlss");
+  if (rel && sig_match(rel, "48 89 5c 24 08 57 48 83 ec 20 48 8b 1d"))
+    hook_fn(rel, (void*)hk_ReleaseFeature, (void**)&o_ReleaseFeature, "NVSDK_NGX_D3D12_ReleaseFeature");
+  else
+    TH_LOG("dlss: NVSDK_NGX_D3D12_ReleaseFeature missing or signature mismatch at %p: the HUD won't see DLSS turned off", rel);
 }
 
 }  // namespace th
