@@ -119,9 +119,9 @@ type = "enum"
 label = "Present pacing"
 values = [
   { value = "ready", label = "As soon as ready" },
-  { value = "smooth", label = "Smooth (even spacing; not yet measured)" },
+  { value = "smooth", label = "Smooth (even spacing)" },
 ]
-default = "ready"
+default = "smooth"
 apply = "live"
 
 [option."fg.camera"]
