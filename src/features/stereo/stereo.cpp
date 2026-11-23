@@ -433,19 +433,38 @@ void fence_dump(int n) {
 // fix, branch wip/stereo-hdr-level-change).
 std::atomic<bool> g_rt_async_keep{false};
 int g_rt_async_saved = -1;  // the engine's value while we hold it off
+int g_rt_upload_saved = -1;
+uint8_t* d3d_rt_upload() {
+  static uint8_t* p = nullptr;
+  static bool done = false;
+  if (!done) {
+    done = true;
+    Image d = module_image(kD3D);
+    auto* dos = d ? reinterpret_cast<const IMAGE_DOS_HEADER*>(d.base) : nullptr;
+    auto* nt = dos ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(d.base + dos->e_lfanew) : nullptr;
+    if (nt && nt->FileHeader.TimeDateStamp == kD3DStamp) p = reinterpret_cast<uint8_t*>(d.at(kRvaD3DRtAsyncUpload));
+    else TH_LOG("stereo: d3d build differs: RT async upload left as is");
+  }
+  return p;
+}
+void hold_byte(uint8_t* v, int& saved, bool hold, const char* what) {
+  if (!v) return;
+  if (hold) {
+    if (saved < 0) {
+      saved = *v;
+      if (*v) TH_LOG("stereo: %s off while side-by-side renders", what);
+    }
+    *v = 0;
+  } else if (saved >= 0) {
+    *v = uint8_t(saved);
+    saved = -1;
+  }
+}
 void rt_async_hold(bool hold) {
   if (!g_rimg) return;
-  uint8_t& v = rglob<uint8_t>(kRvaRtAsyncBuild);
-  if (hold && !g_rt_async_keep.load()) {
-    if (g_rt_async_saved < 0) {
-      g_rt_async_saved = v;
-      if (v) TH_LOG("stereo: RT async build off while side-by-side renders");
-    }
-    v = 0;
-  } else if (g_rt_async_saved >= 0) {
-    v = uint8_t(g_rt_async_saved);
-    g_rt_async_saved = -1;
-  }
+  bool h = hold && !g_rt_async_keep.load();
+  hold_byte(&rglob<uint8_t>(kRvaRtAsyncBuild), g_rt_async_saved, h, "RT async build");
+  hold_byte(d3d_rt_upload(), g_rt_upload_saved, h, "RT async upload (async ray dispatch)");
 }
 
 double eye_offset(const Params& p, int eye) {

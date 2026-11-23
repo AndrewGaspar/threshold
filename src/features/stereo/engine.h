@@ -161,6 +161,14 @@ constexpr char kSigVideoUpdateAsync[] = "48 89 5c 24 10 57 48 83 ec 50 80 3d ?? 
 // queues (graphics, async compute, d3d's async raytrace queue; live fence trace, docs/stereo.md), so
 // it is switched off while side-by-side pairs render (the build then runs on the graphics queue).
 constexpr uintptr_t kRvaRtAsyncBuild = 0x90e540;
+// "rtd:Enable async upload" (d3d bool tweakable value, default 1; constructor d3d+0x1760), latched into
+// d3d+0xf6c30 by `present` (d3d+0x31b50): with it each DeviceUtilRaytracing::raytrace (d3d+0x353e0)
+// records its ray work as a job that a second queue executes later (flushed at 16 pending calls or at
+// Present, d3d+0x31340), lagging graphics by two calls, and graphics waits for it. Off, the rays run
+// on the graphics queue in order. In sbs the right eye rebuilds the acceleration structures while
+// the left eye's rays may still be in flight on that queue; at a level change that hung the GPU
+// (rayblaster r8: the ray queue's list never completed, with the async build already off).
+constexpr uintptr_t kRvaD3DRtAsyncUpload = 0x136d20;
 
 // High-res screenshot tiles (slots 25-27 write them): the renderer's own "several renders per
 // update" guards compare them. The graph's Cleanup pass refreshes object previous transforms
