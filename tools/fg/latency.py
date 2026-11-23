@@ -8,8 +8,9 @@ CLOCK_MONOTONIC_RAW ns. inject.csv: `quiver lab mouse ... --repeat N --log FILE`
 CLOCK_MONOTONIC_RAW time column).
 
 For every injected mouse motion at time t, the reaction frame is the first frame whose DLSS
-evaluation was recorded after t with a camera turned by more than threshold_deg from the camera of
-the last frame recorded before t. Stages (ms after the input):
+evaluation was recorded after t with a camera turned by more than the threshold (threshold_deg, at
+least 3x the 90th percentile of the frame-to-frame turn, so an idle sway doesn't count) from the
+camera of the last frame recorded before t. Stages (ms after the input):
   eval recorded (CPU)  the game's DLSS SR evaluation recorded on the renderer thread
   DLSS ran (GPU)       GPU timestamp right after it
   frame done (GPU)     the queue reached our Present-time work: the frame's own GPU work is done
@@ -70,7 +71,10 @@ def main():
         print(f"frames: {len(fr)} over {span:.1f} s = {len(fr) / span:.1f} rendered fps, {gen:.2f} generated per frame")
     d = sorted(angle(fr[i - 1][2], fr[i][2]) for i in range(1, len(fr)))
     if d:
-        print(f"camera frame-to-frame turn: median {d[len(d) // 2]:.4f} deg, p90 {d[int(len(d) * .9)]:.4f}; threshold {thr}")
+        # The camera can sway on its own (idle animation): keep the threshold well above that noise.
+        p90 = d[int(len(d) * .9)]
+        thr = max(thr, 3 * p90)
+        print(f"camera frame-to-frame turn: median {d[len(d) // 2]:.4f} deg, p90 {p90:.4f}; threshold {thr:.3f}")
     stages = {k: [] for k in ("eval", "gpu_eval", "frame", "fg", "first", "real")}
     misses = 0
     for t in ts:
