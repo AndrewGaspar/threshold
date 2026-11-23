@@ -1,9 +1,9 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **This branch (wip/stereo-hdr-level-change)** defaults `rt_async_build` to 0: the HDR level-change hang
-> fix is on, untested. On `main`, `[stereo] rt_async_build` defaults to 1 (the engine's own setting: no
-> level-change hang in SDR on rayblaster). The HDR level-change hang fix (hold the async build off while pairs
-> render) is on branch `wip/stereo-hdr-level-change`, untested (resume notes under "Level-change hang").
+> **This branch (wip/stereo-hdr-level-change)**: the HDR level-change hang is a GPU page fault
+> (Xid 13 MMU fault, rayblaster r9), not the async-queue race first suspected. Holding the async RT
+> paths off did not fix it; `rt_async_build` defaults to 1 again (the engine's settings, as on main).
+> Still open; see "Level-change hang".
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -367,7 +367,7 @@ Not implemented: FG is not settled, and (a)-(c) mean two features and two input 
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
 | dev: `history_mask` | 30 | 1 graph persisted list (off by default: measured worse), 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
-| dev: `rt_async_build` | 0 | 1 = leave "rtd:Enable async build" on during sbs (off by default while pairs render; level-change hang) |
+| dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | dev: `hdr_hud_wide` | 0 | start-up: HDR UI target allocated 2W (HUD in both eyes; hung the GPU in r25) |
 | dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection); synthetic yaw °/update |
@@ -431,7 +431,36 @@ Three queues take part:
 **Tried.** Skipping the right eye's acceleration-structure job (the scene is the same for both eyes)
 hung at once, after 2 pairs: `raytrace()` waits on state that the build advances. Removed.
 
-**Under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
+**2026-11-23, rayblaster r8 (HDR, async build held off, `hdr_hud_wide = 1`, throttled: the user was
+playing).** Still hung on the first teleport (37 `signaller_worker` timeouts). The trace has no async
+compute any more. Graphics and d3d's async raytrace queue (`rtd:Enable async upload`, below) are both
+stuck at 17040 (fences 1a23340 / 1a22b20). The raytrace queue is past its wait for graphics' 17040,
+and its executed list never signals 17041. Once again a queue that traces rays against the
+acceleration structures does not finish its list. Reading: the right eye rebuilds the BLAS/TLAS
+(now on graphics) while the left eye's rays are still running on the async raytrace queue, which lags
+graphics by two `raytrace()` calls by design. No fence orders the rebuild after those rays; during
+streaming the builds and the traversal are long enough to collide. So the async ray dispatch is held
+off too (`rtd:Enable async upload`, d3d+0x136d20, a tweakable latched at each Present). Then every RT
+build and trace runs on the graphics queue in order. Commit 30983a7.
+
+**r9 (both async paths held off): still hangs**, on the first teleport (39 `signaller_worker`
+timeouts). Now every fence op is on the graphics queue and there are no waits at all: graphics simply
+stops completing its own lists. rayblaster's kernel log names the cause for both runs:
+- r8 (jump at 00:53:41): `Xid 109 CTX SWITCH TIMEOUT` for Control_DX12 at 00:53:54.
+- r9 (jump at 01:04:32): `Xid 13 Graphics SM Warp Exception: MMU Fault` for Control_DX12 at 01:04:36.
+
+So it is a GPU page fault: during the level change, a shader reads memory that is no longer mapped
+(a use-after-free). With the async queues it showed up as a hang on whichever queue traced rays.
+Holding the async paths off does not fix it, and is reverted to the engine's setting
+(`rt_async_build = 1` is the default again).
+
+Next suspects, bisected on HDR (SDR survived 7 loads; every HDR run with teleports so far had
+`hdr_hud_wide = 1`): (a) the 2W HDR UI target; (b) a resource the engine frees through its deferred
+cleanup between the eyes (Scene update runs `executeDeferredThreadCleanup` per render, renderer
++0x124258; the RT job's `finishThread` cleanup at +0xa8c55), while the other eye's commands still
+reference it.
+
+**Superseded: under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
 off (`rt_async_hold`; dev `rt_async_build = 1` keeps the engine's setting). The build then runs on
 the graphics queue, in order with both eyes' rays; the async-compute leg of the cycle disappears. The
 engine's value is restored on the first mono frame. Built, synced to rayblaster and launched in HDR

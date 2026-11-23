@@ -431,7 +431,7 @@ void fence_dump(int n) {
 // kRvaRtAsyncBuild). stereo.rt_async_build = 1 (main's default: verified in SDR) leaves the engine's
 // setting alone; 0 holds the async build off while pairs render (the untested HDR level-change hang
 // fix, branch wip/stereo-hdr-level-change).
-std::atomic<bool> g_rt_async_keep{false};
+std::atomic<bool> g_rt_async_keep{true};  // default: the engine's settings (holding them off did not fix the hang, r9)
 int g_rt_async_saved = -1;  // the engine's value while we hold it off
 int g_rt_upload_saved = -1;
 uint8_t* d3d_rt_upload() {
