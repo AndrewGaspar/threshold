@@ -487,7 +487,7 @@ Reload_t o_reload;
 std::atomic<void*> g_lc_jp{nullptr};
 std::atomic<uint64_t> g_lc_reload_tick{0}, g_lc_tail_until{0};
 std::atomic<uint64_t> g_lc_begin{0};  // when the current level change began (0: none)
-std::atomic<bool> g_load_mono{true};
+std::atomic<bool> g_load_mono{false};  // stereo.load_mono (dev): the root cause is fixed (as_once), r18
 std::atomic<uint64_t> g_n_load_mono{0}, g_n_level_changes{0};
 uintptr_t g_onIsLoading = 0;
 void __fastcall hk_useJp(void* jp, bool reload, bool debug) {
@@ -759,9 +759,10 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
 // eye only). While our renderHUD call runs, that one allocation is made 2W wide.
 Alloc_t o_rt_alloc;
 std::atomic<int> g_hud_hdr_w{0};  // armed: the eye width
-// stereo.hdr_hud_wide (dev, default 0): live r25 the GPU stopped ~60 pairs after enabling this (the
-// renderer thread then blocked in our next copyRegion), so the HDR HUD stays in the left eye for now.
-std::atomic<bool> g_hud_wide_on{false};
+// stereo.hdr_hud_wide (default 1): the HDR UI target 2W wide during our renderHUD. The laptop's r25
+// "hang" with it was the wedged driver (VRAM); on rayblaster it ran through r3, r15 and r18 (teleports,
+// restart) with the HUD in both eyes.
+std::atomic<bool> g_hud_wide_on{true};
 std::atomic<uint64_t> g_n_hud_wide{0};
 void* __fastcall hk_rt_alloc(void* mgr, const void* init, const char* name) {
   int w = g_hud_hdr_w.load(std::memory_order_relaxed);
@@ -1278,7 +1279,7 @@ void stereo_start() {
   eyestate_start(g_rimg);
   if (cfg_bool("stereo.fence_trace", false)) fence_trace_start();
   level_hooks_start();
-  if (cfg_bool("stereo.hdr_hud_wide", false) &&
+  if (cfg_bool("stereo.hdr_hud_wide", true) &&
       !hook_fn((void*)g_rt_alloc, (void*)hk_rt_alloc, (void**)&o_rt_alloc, "RenderTargetManager::allocTexture2D"))
     o_rt_alloc = nullptr;  // only hooked when the dev option asks for it (start-up)
   if (void* vu = module_export(kRenderer, kExpVideoUpdateAsync, "stereo"); vu && sig_match(vu, kSigVideoUpdateAsync)) {
