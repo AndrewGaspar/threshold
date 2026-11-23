@@ -1,8 +1,9 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Status:** the level-change double BLAS build/compaction is fixed (`as_once`; rayblaster r18/r19).
-> **Open:** with ray tracing on, 3D play (sbs, and even `mode = left`) still faults the GPU after
-> seconds to minutes in the world (rayblaster r20-r37; mono passes): see "Level-change hang". All
+> **Status:** 3D with ray tracing no longer faults the GPU (rayblaster r41-r44, RT reflections):
+> the right eye's acceleration-structure job now runs the BLAS builds that only it has
+> (`as_once = 5`), and the frame is mono during level changes until streaming settles
+> (`load_mono = 1`, ~30-40 s after a teleport). See "Level-change hang". All
 > temporal history is per eye by default now (`history_mask = 63`, measured r38). The HDR HUD is in
 > both eyes by default (`hdr_hud_wide`). Frame generation (2x-4x, SDR and HDR) runs together with 3D,
 > per eye (measured rayblaster r2-r9, RT off): "Stereo with frame generation".
@@ -44,7 +45,8 @@ left, right eye right, the HUD hint in both halves.*
 | Separation, convergence (image shift in sbs, projection in left/right), swap eyes | done, live | measured |
 | `mode = auto`, `output = auto`, Hyprland window tag, Quiver stereo layout | done | live in the lab only without Hyprland (auto → off/none); HypXRland not tested |
 | Frame generation at the same time (2x-4x, per eye: two DLSS-G features, per-eye inputs, HUD-less from the side-by-side texture) | done | measured, rayblaster r4-r5, "Stereo with frame generation" |
-| Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once`: right eye skips BLAS build/compaction) | live, rayblaster r18 (HDR) + r19 (SDR), "Level-change hang" |
+| Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once = 5`: the right eye skips the left eye's BLAS builds/compactions and runs its own new builds; `load_mono`: mono until streaming settles) | live, rayblaster r18/r19 (RT on, old as_once), r43 (22 teleports, RT reflections), "Level-change hang" |
+| Ordinary play with RT on in sbs (the in-world GPU fault) | fixed (`as_once = 5`) | live, rayblaster r41/r42 (14 and 10 min in the world, every earlier 3D run faulted within ~3 min) |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
 mono 81.4 / 61.2 presents/s, sbs 40.9 / 30.9 (two rounds; the ratio is 0.50 both times).
@@ -491,8 +493,8 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
 | dev: `history_mask` | 63 | per-eye sets: 1 graph persisted list, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring, 32 the RT reflection filter's output history (only with 2). All on: measured best (r38) |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
-| dev: `as_once` | 1 | mask: 1 the right eye's AS job skips the engine's BLAS build/compaction lists (the level-change fault fix), 2 also its dynamic-BLAS refit list; 0 runs them twice. The right eye's job is the pair's second, by order (the job runs on a worker thread) |
-| dev: `load_mono` | 0 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading): avoids the level-change GPU fault |
+| dev: `as_once` | 5 | mask: 1 the right eye's AS job skips the build/compaction entries the left eye's job ran in this pair; 4 it still runs the build entries only it has (without 4 they were dropped: the in-world RT fault); 8 also the compaction entries only it has (hung a teleport, off); 2 also skips its dynamic-BLAS refit list; 0 runs everything twice. The right eye's job is the pair's second, by order (the job runs on a worker thread) |
+| dev: `load_mono` | 1 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
@@ -509,8 +511,12 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
   fault below comes first) or on HypXRland. hsbs only smoke-tested (no HUD-less there). The rendered
   rate costs 4-10 % for the second DLSS-G feature; latency with stereo was not measured.
 
-- **GPU fault in 3D play with ray tracing** (MMU fault, one shader, minutes into play; mono is fine):
-  see "Level-change hang" for the bisect so far. Workaround: RT off in 3D.
+- **Why the right eye's new BLAS builds hang during a level change** (Xid 109, r41/r42) is not
+  known; `load_mono` keeps those frames mono instead (2D for ~30-40 s after each teleport). Suspect:
+  BLAS storage is allocated on worker jobs ("rtd:Threaded resource allocation", static
+  renderer+0x151570 `RaytracingStaticMeshStorage`) and an entry that enters the lists between the
+  eyes may be built before its allocation has finished. `mode = left` faulted once in r33 (one
+  render, moved camera); not explained by this fix and not re-tested.
 - **HDR HUD brightness / paper white** were not compared to mono (only presence in both eyes).
 - **Exclusive fullscreen with `output = full`** stalls at the title (also without the window code):
   use borderless or windowed.
@@ -545,7 +551,7 @@ put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bi
 - Both eyes are correct afterwards, HUD in both (screenshot).
 Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
 
-**Open: a GPU fault in ordinary 3D play with ray tracing (rayblaster r20-r37, SDR, main's code).**
+**Fixed: the GPU fault in ordinary 3D play with ray tracing (rayblaster r20-r44, SDR).**
 Continue from the game-start fixture, let the opening cinematic play untouched
 (`re/scripts/stereo_rb_cinematic.sh MODDIR`): the player gets control at ~431 s, and in sbs the GPU
 faults some seconds to minutes later. Every fault is the same (`Xid 13`, "SM Warp Exception: MMU
@@ -567,14 +573,38 @@ every run, so one particular shader faults on a memory access each time); r21 wa
 | r34 | sbs, `separation = 0` (both eyes the game's own view) | fault, ~181 s |
 | r37 | `mode = off` again (packed `output = full`, as in all runs) | **no fault** (8 min of control) |
 
-So RT is needed (reflections alone suffice), and either a second render per frame (r34, no camera
-change) or a moved camera with one render (r33) triggers it; mono with the same build and output
-passed twice (13 min in all). Nothing swapped per eye is involved (r26, r33), and less right-eye AS
-work (r23, r30) only delays it. Not yet identified. The fixed fault address
-points at one shader reading freed or never-written memory (a BLAS, TLAS instance or shader-table
-record). Teleporting away early (r18/r19) avoided it, which is why the level-change tests passed.
-Workaround until then: RT off in 3D. Dev verb for further bisecting: `stereo tweak <name> <value>`
-(the engine's `d::BaseTweakable::setTweakable`, e.g. the `rtd:` switches).
+So RT is needed (reflections alone suffice), mono passes, and nothing swapped per eye is involved.
+
+**Cause: builds the right eye dropped.** `as_once` (1) zeroed the right eye's build and compaction
+lists on the assumption that the left eye's job had run the same entries. It had not always: objects
+enter the lists between the two eyes (streaming finishes at any time; the right eye's update sees
+skinned objects as "not built last frame"), and their builds were dropped. The engine then treats
+them as built, and rays that reach such a BLAS read memory that was never written: the MMU fault.
+Shown live by counting (`stereo status` `as_new` / `as_new_built`, r41/r42): ~0.1 right-eye-only
+entries per pair in the idle lobby, about half of them builds (r42: 5480 new builds in 63342 pairs).
+
+**Fix (`as_once = 5`, `load_mono = 1`, default).** The left eye's job records its build and compaction
+entries (pointers). The right eye's job skips those and runs the build entries that only it has
+(bit 4). Compaction entries that only it has are still skipped (bit 8 off): the engine lists them
+again next update. Running the right eye's new builds hangs during a level change (r41 with bit 8,
+r42 without: `Xid 109` within seconds of the first teleport, after 14 and 10 min without a fault in
+the world), so the frame stays mono while the engine changes level and until BLAS-build bursts settle
+(`load_mono`, ~30-40 s after a teleport, r43).
+
+| run | settings (sbs, RT reflections only) | result |
+|---|---|---|
+| r40 | old defaults (`as_once = 1`), vkd3d breadcrumbs | fault ~2.5 min after control (device lost reported, no breadcrumb dump) |
+| r41 | `as_once = 5`, new compactions run too (then bit 4 covered all lists) | **14 min in the world, no fault**; first teleport: `Xid 109` |
+| r42 | `as_once = 5` (builds only) | **10 min in the world, no fault** (5480 new builds run); first teleport: `Xid 109` |
+| r43 | `as_once = 5`, `load_mono = 1` | **22 teleports in 610 s, no Xid, no `signaller_worker` timeout** |
+| r44 | the shipped defaults on main + this branch | see below |
+
+Leads checked and ruled out: the eye's `m::View` copy is not kept past `renderWorld` (static:
+renderer+0x11daf0 copies it into the renderer's own `rend::View` at +0x678 and clears its only
+pointer, `renderer+0x8029d8`, before returning), and sbs with `separation = 0` (no copy) faulted
+too (r34). The AS job's eye attribution was not it either (r31, `as_late` 0). Async ray dispatch
+off still faulted (r23). Dev verb used for bisecting: `stereo tweak <name> <value>` (the engine's
+`d::BaseTweakable::setTweakable`, e.g. the `rtd:` switches).
 
 **Soak with RT off (rayblaster r39, SDR, `history_mask = 63`, all RT effects 0 in renderer.ini).**
 6 teleports and a checkpoint restart, then 15 min of teleport cycles (32 teleports in 928 s, ~20 s of
