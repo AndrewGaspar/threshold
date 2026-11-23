@@ -92,4 +92,4 @@ share one instance in turn, or do static work while another holds the GPU (`quiv
 
 - Every claim in `docs/`/`re/` notes says how it was established (export, static, live, measured).
 - Features must be inert when their config is off; a hook with the feature off is a pass-through.
-- Don't commit unless the user asks.
+- Commit verified milestones as you go (logical commits, pushed to origin); unverified work goes on `wip/*` branches.
