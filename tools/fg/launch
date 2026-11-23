@@ -1,23 +1,28 @@
 #!/usr/bin/env bash
 # tools/fg/launch INSTANCE MODDIR: launch Control from the game-start fixture with MODDIR, drive the
 # menus (Return, Return, Escape, Return = Continue), skip the cinematics (nav `skip` verb) and wait
-# until the player has camera control. Runs where the instance is (tools/lab/rb on rayblaster).
+# until the player has camera control. Q (env) is the quiver command, e.g. Q="quiver --machine
+# rayblaster" to drive rayblaster's lab from here (--mod uploads MODDIR); the saves are made writable
+# over SSH then (RB_HOST, default rayblaster).
 set -uo pipefail
 inst=$1 mod=$2
 export QUIVER_SOURCE=${QUIVER_SOURCE:-agent:threshold-fg}
-quiver lab kill "$inst" >/dev/null 2>&1
-quiver lab fixture install "$inst" game-start >/dev/null 2>&1
-chmod -R u+w "$HOME/Games/quiver-lab/instances/$inst/prefix/drive_c/users/steamuser/Documents/My Games/Control/Saves"
-quiver lab launch "$inst" --mod "$mod" --wait frame --timeout 300 | tail -1
+Q=${Q:-quiver}
+saves="Games/quiver-lab/instances/$inst/prefix/drive_c/users/steamuser/Documents/My Games/Control/Saves"
+$Q lab kill "$inst" >/dev/null 2>&1
+$Q lab fixture install "$inst" game-start >/dev/null 2>&1
+if [[ $Q == *--machine* ]]; then ssh -o BatchMode=yes "${RB_HOST:-rayblaster}" "chmod -R u+w \"\$HOME/$saves\""
+else chmod -R u+w "$HOME/$saves"; fi
+$Q lab launch "$inst" --mod "$mod" --wait frame --timeout 300 | tail -1
 for k in Return Return Escape Return; do
-  quiver lab shot "$inst" /dev/null --settle 4 >/dev/null 2>&1 || true
-  quiver lab key "$inst" "$k" >/dev/null
+  $Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 4 >/dev/null 2>&1 || true
+  $Q lab key "$inst" "$k" >/dev/null
 done
-quiver lab call "$inst" skip for=120 >/dev/null 2>&1 || echo "no skip verb"
+$Q lab call "$inst" skip for=120 >/dev/null 2>&1 || echo "no skip verb"
 end=$((SECONDS + 240))
-until quiver lab where "$inst" 2>/dev/null | grep -q '"control":true' || ((SECONDS > end)); do
-  quiver lab shot "$inst" /dev/null --settle 3 >/dev/null 2>&1
+until $Q lab where "$inst" 2>/dev/null | grep -q '"control":true' || ((SECONDS > end)); do
+  $Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 3 >/dev/null 2>&1
 done
-quiver lab shot "$inst" /dev/null --settle 6 >/dev/null
-quiver lab status "$inst" | sed -n 3p
-quiver lab host | head -1
+$Q lab shot "$inst" "${TMPDIR:-/tmp}/fg-launch-shot.png" --settle 6 >/dev/null
+$Q lab status "$inst" | sed -n 3p
+$Q lab host | head -1

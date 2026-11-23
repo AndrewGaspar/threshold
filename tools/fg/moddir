@@ -1,10 +1,10 @@
 #!/usr/bin/env bash
-# tools/fg/moddir OUT [section.key=value ...]: tools/lab/moddir for the fg build directory
-# (build-fg/mod): a mod copy with start-only settings (e.g. fg.enabled=1). Prints OUT.
+# tools/fg/moddir OUT [section.key=value ...]: tools/lab/moddir for a chosen build directory
+# ($MOD_SRC, default build/mod): a mod copy with start-only settings (e.g. fg.enabled=1). Prints OUT.
 set -euo pipefail
 root=$(cd "$(dirname "$0")/../.." && pwd)
 out=$1; shift
-rm -rf "$out"; cp -r "$root/build-fg/mod" "$out"
+rm -rf "$out"; cp -r "${MOD_SRC:-$root/build/mod}" "$out"
 for kv in "$@"; do
   key=${kv%%=*}; val=${kv#*=}; sec=${key%%.*}; k=${key#*.}
   python3 -I - "$out/threshold.ini" "$sec" "$k" "$val" <<'PY'
