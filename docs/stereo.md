@@ -457,6 +457,12 @@ record). Teleporting away early (r18/r19) avoided it, which is why the level-cha
 Workaround until then: RT off in 3D. Dev verb for further bisecting: `stereo tweak <name> <value>`
 (the engine's `d::BaseTweakable::setTweakable`, e.g. the `rtd:` switches).
 
+**Soak with RT off (rayblaster r39, SDR, `history_mask = 63`, all RT effects 0 in renderer.ini).**
+6 teleports and a checkpoint restart, then 15 min of teleport cycles (32 teleports in 928 s, ~20 s of
+rendering after each) with 3D on throughout: pairs 9051 → 137467, 43 level changes, no
+`signaller_worker` timeout, no Xid. (A restart lands in a pre-rendered video, so the soak skips it
+before cycling.) With RT on the in-world fault above comes first.
+
 **SDR re-check (run r19, the branch's shipped defaults).** 6/6 teleports with 3D on throughout
 (pairs 1392 → 3012). Then a checkpoint restart: the game kept presenting (present 31399 → 34590)
 while the restart played back to the game start, with no world renders yet when the run ended. One
