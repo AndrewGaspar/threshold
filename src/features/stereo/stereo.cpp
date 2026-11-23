@@ -308,8 +308,9 @@ int __cdecl hk_rand() {
 using VideoUpdate_t = void(__fastcall*)(void* self, float t, int where);
 VideoUpdate_t o_videoUpdate;
 std::atomic<uint64_t> g_n_video_skip{0};
+std::atomic<bool> g_video_once{true};  // stereo.video_once (dev): 0 = the right eye decodes too
 void __fastcall hk_videoUpdate(void* self, float t, int where) {
-  if (g_vis_phase.load(std::memory_order_relaxed) == 2 && GetCurrentThreadId() == g_vis_tid.load()) {
+  if (g_video_once.load(std::memory_order_relaxed) && g_vis_phase.load(std::memory_order_relaxed) == 2 && GetCurrentThreadId() == g_vis_tid.load()) {
     g_n_video_skip++;
     return;
   }
@@ -525,16 +526,32 @@ bool engine_loading() {
 using AsJob_t = void(__fastcall*)(void** cap);
 AsJob_t o_asJob;
 std::atomic<uint64_t> g_last_blas_tick{0}, g_n_blas_builds{0};
+std::atomic<double> g_blas_avg{8.0};
+// The right eye's job also skips the BLAS build (+0x40/+0x50) and compaction (+0x60, count +0x68)
+// lists: the left eye's job has built them for this update (the right eye's TLAS, refits and rays use
+// those). A second build or compaction of the same new BLASes in one update looked like the
+// level-change use-after-free (compaction frees the source BLAS). stereo.as_once = 0 runs them twice.
+std::atomic<bool> g_as_once{true};
+std::atomic<uint64_t> g_n_as_skipped{0};
 void __fastcall hk_asJob(void** cap) {
-  if (cap && *cap) {
-    auto* sc = static_cast<uint8_t*>(*cap);
-    uint32_t n = *reinterpret_cast<uint32_t*>(sc + 0x48) + *reinterpret_cast<uint32_t*>(sc + 0x58);
-    if (n) {
-      g_last_blas_tick = GetTickCount64();
-      g_n_blas_builds += n;
-    }
-  }
+  uint8_t* sc = cap && *cap ? static_cast<uint8_t*>(*cap) : nullptr;
+  if (!sc) return o_asJob(cap);
+  auto cnt = [&](size_t off) -> uint32_t& { return *reinterpret_cast<uint32_t*>(sc + off); };
+  uint32_t n = cnt(0x48) + cnt(0x58);
+  g_n_blas_builds += n;
+  // Dynamic objects get BLAS builds every render (~7 per render in the lobby, live r17), so streaming
+  // is a burst above the usual rate: an average kept outside level changes, and "active" above 2x+8.
+  double avg = g_blas_avg.load();
+  if (!g_lc_begin.load()) g_blas_avg = avg * 0.98 + n * 0.02;
+  else if (n > 2 * avg + 8) g_last_blas_tick = GetTickCount64();
+  if (!g_as_once.load() || g_vis_phase.load() != 2 || (!n && !cnt(0x68))) return o_asJob(cap);
+  uint32_t save[3] = {cnt(0x48), cnt(0x58), cnt(0x68)};
+  cnt(0x48) = cnt(0x58) = cnt(0x68) = 0;
+  g_n_as_skipped += save[0] + save[1] + save[2];
   o_asJob(cap);
+  const size_t offs[3] = {0x48, 0x58, 0x68};
+  for (int i = 0; i < 3; i++)
+    if (cnt(offs[i]) == 0) cnt(offs[i]) = save[i];  // the engine clears them itself at its own time
 }
 // A level change keeps the frame mono until the engine is done (signals above) and then until no
 // new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
@@ -983,7 +1000,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -991,7 +1008,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
@@ -1140,6 +1157,10 @@ void stereo_register() {
     } else if (id == "stereo.output") {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
+    } else if (id == "stereo.as_once") {
+      g_as_once = !(v == "0" || v == "false" || v == "off");
+    } else if (id == "stereo.video_once") {
+      g_video_once = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.load_mono") {
       g_load_mono = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.rt_async_build") {

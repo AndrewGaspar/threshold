@@ -19,7 +19,7 @@ if ! q wait $i in-world --timeout 240 >/dev/null 2>&1; then   # the DLC promo pa
 fi
 q key $i space --hold 1500 >/dev/null
 for n in $(seq 1 15); do q key $i space >/dev/null; q shot $i /dev/null --settle 6 >/dev/null 2>&1; q where $i 2>/dev/null | grep -q '"control":true' && break; done
-st() { q call $i stereo status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print('pairs', d['pairs'], 'present', d['present'], 'hud_wide', d.get('hud_wide'), 'load_mono', d.get('load_mono'), 'changes', d.get('level_changes'))" 2>/dev/null; }
+st() { q call $i stereo status 2>/dev/null | python3 -c "import json,sys; d=json.load(sys.stdin); print('pairs', d['pairs'], 'present', d['present'], 'hud_wide', d.get('hud_wide'), 'load_mono', d.get('load_mono'), 'changes', d.get('level_changes'), 'blas', d.get('blas_builds'))" 2>/dev/null; }
 echo "start: $(st)"
 for loc in mail-room executive-corridor cafeteria motel dead-letters entry-lobby; do
   r=$(q teleport $i $loc --timeout 150 2>&1 | tail -1 | cut -c1-60)
