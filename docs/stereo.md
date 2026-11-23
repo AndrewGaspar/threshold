@@ -1,8 +1,9 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **Branches:** on `main`, `[stereo] rt_async_build` defaults to 1 (the engine's own setting: no
-> level-change hang in SDR on rayblaster). The HDR level-change hang fix (hold the async build off while pairs
-> render) is on branch `wip/stereo-hdr-level-change`, untested (resume notes under "Level-change hang").
+> **This branch (wip/stereo-hdr-level-change)**: the level-change GPU fault is fixed (`as_once`: the
+> right eye no longer re-runs the engine's BLAS build/compaction lists; rayblaster r18, HDR, 6 teleports
+> plus a checkpoint restart with 3D on throughout). The HDR HUD is in both eyes by default
+> (`hdr_hud_wide`). See "Level-change hang".
 
 Threshold renders Control's world twice per game update, once per eye, inside one engine frame,
 and composes them side by side. The design follows Torchbearer's (Alan Wake Remastered,
@@ -37,11 +38,11 @@ left, right eye right, the HUD hint in both halves.*
 | TAA without DLSS (`m_eDLSSQuality: 0`) | done | measured r23 |
 | `output = full` on a plain 2W-wide desktop: window widened, mouse per eye | done (borderless, windowed) | live, 3840x1080 lab display |
 | HDR (FP16 scRGB swapchain): both eyes composed | done | live r24 (1046 pairs) |
-| HDR: HUD in both eyes | **left eye only** (fix attempt hung the GPU) | live r24, r25 |
+| HDR: HUD in both eyes | done (`hdr_hud_wide`: the UI target 2W wide) | live, rayblaster r3/r15/r18 (r25's laptop hang was the wedged driver) |
 | Separation, convergence (image shift in sbs, projection in left/right), swap eyes | done, live | measured |
 | `mode = auto`, `output = auto`, Hyprland window tag, Quiver stereo layout | done | live in the lab only without Hyprland (auto → off/none); HypXRland not tested |
 | Frame generation at the same time | stereo stays off (logged); design below | live |
-| Level change (jump point / teleport) while in sbs | SDR: no hang on rayblaster (7 loads); HDR: hangs (async-compute AS build vs raytrace queue); fix under test | live, "Level-change hang" |
+| Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once`: right eye skips BLAS build/compaction) | live, rayblaster r18 (HDR) + r19 (SDR), "Level-change hang" |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
 mono 81.4 / 61.2 presents/s, sbs 40.9 / 30.9 (two rounds; the ratio is 0.50 both times).
@@ -366,9 +367,11 @@ Not implemented: FG is not settled, and (a)-(c) mean two features and two input 
 | `dlss_per_eye` | 1 | a DLSS feature per eye |
 | dev: `history_mask` | 30 | 1 graph persisted list (off by default: measured worse), 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
-| dev: `rt_async_build` | 0 | 1 = leave "rtd:Enable async build" on during sbs (off by default while pairs render; level-change hang) |
+| dev: `as_once` | 1 | the right eye skips the engine's BLAS build/compaction lists (the level-change fault fix); 0 runs them twice |
+| dev: `load_mono` | 0 | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading): avoids the level-change GPU fault |
+| dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
-| dev: `hdr_hud_wide` | 0 | start-up: HDR UI target allocated 2W (HUD in both eyes; hung the GPU in r25) |
+| `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
 | dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection); synthetic yaw °/update |
 
 `output = auto` (start-up): on a HypXRland stereo display `sbs` if the larger-swapchain Proton is in
@@ -392,7 +395,41 @@ packed and the game's monitor is a stereo output (core/hyprland.cpp, polled each
 - No pass-2 shortcuts (shadow maps, probes reused by the second eye): sbs costs a full second
   world render. Same-update vs frame-sequential under a pan (`test_pan`) was not measured.
 
-## Level-change hang (open; fix under test)
+## Level-change hang (fixed: `as_once`)
+
+**Cause.** Each world render's "Scene update" launches the ray-tracing acceleration-structure job
+(renderer+0xa89c0). It refits dynamic BLASes, builds BLASes for every object in its build lists
+(scene+0x40/+0x50, counts +0x48/+0x58) and runs the compaction list (+0x60, count +0x68), then builds
+the TLAS. In sbs the right eye ran the same lists again in the same update. A second build of the same
+new BLASes, and above all a second compaction (it frees the source), left GPU work pointing at freed
+memory. That surfaced as `Xid 13 MMU fault` or `Xid 109` (r8-r16), only when many objects stream in
+at once (a level change) and in the seconds after it, while compactions run.
+
+**Fix (`as_once`, default 1).** The right eye's job runs with those three counts set to 0. It still
+refits and builds its TLAS from the BLASes the left eye's job built in this update, and the counts are
+put back for the engine. Static: the job's lists, renderer+0xa89c0. Live: the bisect below, and r18.
+
+**Verified (rayblaster, run r18, HDR, `hdr_hud_wide = 1`, `load_mono = 0`).**
+- 6/6 teleports (mail-room, executive-corridor, cafeteria, motel, dead-letters, entry-lobby) and a
+  checkpoint restart, with 3D (pairs) running throughout: pairs 2627 → 5330 over the teleports, then
+  9248 → 9465 after the restart.
+- 83517 build/compaction entries skipped for the right eye, against 166974 BLAS builds in total.
+- No `signaller_worker` timeouts and no new Xid.
+- Both eyes are correct afterwards, HUD in both (screenshot).
+Before the fix every HDR run hung on the first teleport (8/8: r3, r4, r8-r11, r14, r16).
+
+**SDR re-check (run r19, the branch's shipped defaults).** 6/6 teleports with 3D on throughout
+(pairs 1392 → 3012). Then a checkpoint restart: the game kept presenting (present 31399 → 34590)
+while the restart played back to the game start, with no world renders yet when the run ended. One
+`signaller_worker` timeout in game.log, no Xid. Before the fix, SDR had passed r2 (6 + restart)
+while HDR hung every time, so the fault was rarer in SDR (fewer or later compactions), not HDR-only.
+
+`load_mono` (dev, default 0 now): renders mono while the engine changes level, then until streaming
+settles. It was the stop-gap before the cause was found. r17: with it on, 6 teleports + restart passed
+without a fault. Its "settled" test counts BLAS-build bursts above the running average; dynamic
+objects build a few BLASes every render, so a plain "no builds" test never settles.
+
+Diagnosis path, kept for the record:
 
 **Retest without VRAM pressure (rayblaster, RTX 5090 32 GB, instance `control-stereo`, GE-Proton11-12,
 same renderer.ini as the laptop: DLSS DLAA, RT on).**
@@ -430,7 +467,82 @@ Three queues take part:
 **Tried.** Skipping the right eye's acceleration-structure job (the scene is the same for both eyes)
 hung at once, after 2 pairs: `raytrace()` waits on state that the build advances. Removed.
 
-**Under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
+**2026-11-23, rayblaster r8 (HDR, async build held off, `hdr_hud_wide = 1`, throttled: the user was
+playing).** Still hung on the first teleport (37 `signaller_worker` timeouts). The trace has no async
+compute any more. Graphics and d3d's async raytrace queue (`rtd:Enable async upload`, below) are both
+stuck at 17040 (fences 1a23340 / 1a22b20). The raytrace queue is past its wait for graphics' 17040,
+and its executed list never signals 17041. Once again a queue that traces rays against the
+acceleration structures does not finish its list. Reading: the right eye rebuilds the BLAS/TLAS
+(now on graphics) while the left eye's rays are still running on the async raytrace queue, which lags
+graphics by two `raytrace()` calls by design. No fence orders the rebuild after those rays; during
+streaming the builds and the traversal are long enough to collide. So the async ray dispatch is held
+off too (`rtd:Enable async upload`, d3d+0x136d20, a tweakable latched at each Present). Then every RT
+build and trace runs on the graphics queue in order. Commit 30983a7.
+
+**r9 (both async paths held off): still hangs**, on the first teleport (39 `signaller_worker`
+timeouts). Now every fence op is on the graphics queue and there are no waits at all: graphics simply
+stops completing its own lists. rayblaster's kernel log names the cause for both runs:
+- r8 (jump at 00:53:41): `Xid 109 CTX SWITCH TIMEOUT` for Control_DX12 at 00:53:54.
+- r9 (jump at 01:04:32): `Xid 13 Graphics SM Warp Exception: MMU Fault` for Control_DX12 at 01:04:36.
+
+So it is a GPU page fault: during the level change, a shader reads memory that is no longer mapped
+(a use-after-free). With the async queues it showed up as a hang on whichever queue traced rays.
+Holding the async paths off does not fix it, and is reverted to the engine's setting
+(`rt_async_build = 1` is the default again).
+
+Next suspects, bisected on HDR (SDR survived 7 loads; every HDR run with teleports so far had
+`hdr_hud_wide = 1`): (a) the 2W HDR UI target; (b) a resource the engine frees through its deferred
+cleanup between the eyes (Scene update runs `executeDeferredThreadCleanup` per render, renderer
++0x124258; the RT job's `finishThread` cleanup at +0xa8c55), while the other eye's commands still
+reference it.
+
+**Bisect (rayblaster, HDR, first teleport to mail-room; the user was playing, lab throttled):**
+
+| run | setting | result |
+|---|---|---|
+| r8 | sbs, async build held off, `hdr_hud_wide` | hang (Xid 109) |
+| r9 | sbs, async build + async ray dispatch held off, `hdr_hud_wide` | hang (Xid 13 MMU fault) |
+| r10 | as r9 without `hdr_hud_wide` | hang (Xid 109) |
+| r11 | sbs, `per_eye = 0`, `dlss_per_eye = 0` (all histories and DLSS shared) | hang |
+| r14 | sbs, `hud_both = 0` (no HUD draw duplication) | hang |
+| r12 | `mode = off`, `output = full` (mono duplicate into both halves) | 6/6 teleports, no timeouts |
+| r13 | `mode = left` (one render per update, camera moved) | 6/6 teleports |
+| r2 | SDR, sbs | 6/6 teleports + a checkpoint restart |
+
+So it needs the second render per update, and none of our per-eye pieces or the HUD causes it. The
+remaining pair-only pieces are the visibility-result reuse, SSAO's per-frame prepare, the `rand()`
+replay, the right eye's skipped video decode, and the engine rendering one packet twice while the
+level streams. The fault is a GPU page fault (a use-after-free): something the engine frees or
+recycles during streaming, on a once-per-update assumption, is still referenced by the other eye's
+commands. Not identified.
+
+**Fallback (commit below): mono while the engine changes level.** Pairs stop and the one image is
+duplicated into both halves (2D for the load) while any of these holds, plus a 2 s tail:
+- a jump point's streaming wait / player hide is pending: useJumpPoint exe+0x4823c0 hooked; it
+  sets bits 0/1 of jp+0xB8 until done (static, as nav reads them);
+- an episode reload started (`ServerGameSession::startReloadingEpisodeFromJumpPoint`, export, hooked)
+  and not finished;
+- `coregame::onIsLoading()` returns true.
+Dev `load_mono = 0` renders pairs through loads. `stereo status`: `level_changes`, `load_mono`
+(mono frames).
+
+**Fallback result (r15, HDR, `hdr_hud_wide = 1`).**
+- 6/6 teleports, with 1565-650 mono frames per jump (`load_mono` 5776 after six) and pairs resumed
+  each time. One `signaller_worker` timeout in game.log; Xid 13 at 01:51:47 belongs to the restart
+  below.
+- The HUD was in both eyes throughout: hud_wide equals pairs.
+- A **checkpoint restart then still faulted** (`Xid 13 MMU fault`, 01:51:47). It hit after pairs had
+  resumed (pairs 6050 → 6933), and no mono frames were rendered during the reload (no world renders
+  while its loading screen shows). So the hazard outlasts the engine's loading state: streaming
+  carries on after the load, and the 2 s tail is not enough.
+- Not safe for main yet. Options:
+  - a longer, activity-based window, e.g. mono until N seconds without new BLAS builds or texture
+    uploads, or simply 10-15 s after any level change;
+  - better, find the use-after-free. Next: the fence trace plus a vkd3d breadcrumb/debug build
+    (`VKD3D_CONFIG=breadcrumbs`) to name the faulting command list, or bisect the pair-only pieces
+    (vis reuse, SSAO prepare, video skip) by forcing each one's mono behaviour.
+
+**Superseded: under test when rayblaster was restarted.** While sbs pairs render, hold "rtd:Enable async build"
 off (`rt_async_hold`; dev `rt_async_build = 1` keeps the engine's setting). The build then runs on
 the graphics queue, in order with both eyes' rays; the async-compute leg of the cycle disappears. The
 engine's value is restored on the first mono frame. Built, synced to rayblaster and launched in HDR

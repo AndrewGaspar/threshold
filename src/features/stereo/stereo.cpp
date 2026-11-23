@@ -20,6 +20,7 @@
 #include <dxgi.h>
 #include <d3d12.h>
 
+#include <algorithm>
 #include <atomic>
 #include <cmath>
 #include <cstdio>
@@ -307,8 +308,9 @@ int __cdecl hk_rand() {
 using VideoUpdate_t = void(__fastcall*)(void* self, float t, int where);
 VideoUpdate_t o_videoUpdate;
 std::atomic<uint64_t> g_n_video_skip{0};
+std::atomic<bool> g_video_once{true};  // stereo.video_once (dev): 0 = the right eye decodes too
 void __fastcall hk_videoUpdate(void* self, float t, int where) {
-  if (g_vis_phase.load(std::memory_order_relaxed) == 2 && GetCurrentThreadId() == g_vis_tid.load()) {
+  if (g_video_once.load(std::memory_order_relaxed) && g_vis_phase.load(std::memory_order_relaxed) == 2 && GetCurrentThreadId() == g_vis_tid.load()) {
     g_n_video_skip++;
     return;
   }
@@ -431,21 +433,180 @@ void fence_dump(int n) {
 // kRvaRtAsyncBuild). stereo.rt_async_build = 1 (main's default: verified in SDR) leaves the engine's
 // setting alone; 0 holds the async build off while pairs render (the untested HDR level-change hang
 // fix, branch wip/stereo-hdr-level-change).
-std::atomic<bool> g_rt_async_keep{true};
+std::atomic<bool> g_rt_async_keep{true};  // default: the engine's settings (holding them off did not fix the hang, r9)
 int g_rt_async_saved = -1;  // the engine's value while we hold it off
+int g_rt_upload_saved = -1;
+uint8_t* d3d_rt_upload() {
+  static uint8_t* p = nullptr;
+  static bool done = false;
+  if (!done) {
+    done = true;
+    Image d = module_image(kD3D);
+    auto* dos = d ? reinterpret_cast<const IMAGE_DOS_HEADER*>(d.base) : nullptr;
+    auto* nt = dos ? reinterpret_cast<const IMAGE_NT_HEADERS64*>(d.base + dos->e_lfanew) : nullptr;
+    if (nt && nt->FileHeader.TimeDateStamp == kD3DStamp) p = reinterpret_cast<uint8_t*>(d.at(kRvaD3DRtAsyncUpload));
+    else TH_LOG("stereo: d3d build differs: RT async upload left as is");
+  }
+  return p;
+}
+void hold_byte(uint8_t* v, int& saved, bool hold, const char* what) {
+  if (!v) return;
+  if (hold) {
+    if (saved < 0) {
+      saved = *v;
+      if (*v) TH_LOG("stereo: %s off while side-by-side renders", what);
+    }
+    *v = 0;
+  } else if (saved >= 0) {
+    *v = uint8_t(saved);
+    saved = -1;
+  }
+}
 void rt_async_hold(bool hold) {
   if (!g_rimg) return;
-  uint8_t& v = rglob<uint8_t>(kRvaRtAsyncBuild);
-  if (hold && !g_rt_async_keep.load()) {
-    if (g_rt_async_saved < 0) {
-      g_rt_async_saved = v;
-      if (v) TH_LOG("stereo: RT async build off while side-by-side renders");
-    }
-    v = 0;
-  } else if (g_rt_async_saved >= 0) {
-    v = uint8_t(g_rt_async_saved);
-    g_rt_async_saved = -1;
+  bool h = hold && !g_rt_async_keep.load();
+  hold_byte(&rglob<uint8_t>(kRvaRtAsyncBuild), g_rt_async_saved, h, "RT async build");
+  hold_byte(d3d_rt_upload(), g_rt_upload_saved, h, "RT async upload (async ray dispatch)");
+}
+
+// ---- level changes render one eye ----------------------------------------------------------------
+// A level change (jump point: fast travel, teleports; checkpoint reload) in sbs hung the GPU on HDR
+// runs: a page fault (Xid 13) or context-switch timeout a few seconds into the jump's streaming
+// wait (docs/stereo.md, "Level-change hang"). The same jump with one render per update (mode
+// left/off) is fine, so while the engine changes level the frame is rendered mono (`end` puts it in
+// both halves: 2D in the glasses for the load) and pairs resume once it is done.
+// - jump points: exe+0x4823c0 useJumpPoint(jp, reload, debug) sets bits 0/1 of jp+0xB8 while its
+//   streaming wait / player hide is pending (static; nav.cpp reads the same bits);
+// - episode reloads: coregame ServerGameSession::startReloadingEpisodeFromJumpPoint (export);
+// - coregame::onIsLoading() (export, a std::function<bool()>), what the engine itself asks.
+// Plus a 2 s tail after each. stereo.load_mono = 0 renders pairs through loads (for testing).
+using UseJp_t = void(__fastcall*)(void* jp, bool reload, bool debug);
+using Reload_t = void(__fastcall*)(void* ses, const void* jp, bool flag);
+UseJp_t o_useJp;
+Reload_t o_reload;
+std::atomic<void*> g_lc_jp{nullptr};
+std::atomic<uint64_t> g_lc_reload_tick{0}, g_lc_tail_until{0};
+std::atomic<uint64_t> g_lc_begin{0};  // when the current level change began (0: none)
+std::atomic<bool> g_load_mono{false};  // stereo.load_mono (dev): the root cause is fixed (as_once), r18
+std::atomic<uint64_t> g_n_load_mono{0}, g_n_level_changes{0};
+uintptr_t g_onIsLoading = 0;
+void __fastcall hk_useJp(void* jp, bool reload, bool debug) {
+  g_lc_jp = jp;
+  if (!g_lc_begin.load()) g_lc_begin = GetTickCount64();
+  g_lc_tail_until = GetTickCount64() + 2000;
+  g_n_level_changes++;
+  o_useJp(jp, reload, debug);
+}
+void __fastcall hk_reload(void* ses, const void* jp, bool flag) {
+  g_lc_reload_tick = GetTickCount64();
+  if (!g_lc_begin.load()) g_lc_begin = GetTickCount64();
+  g_lc_tail_until = GetTickCount64() + 5000;
+  g_n_level_changes++;
+  o_reload(ses, jp, flag);
+}
+bool readable_byte(const void* p) {
+  MEMORY_BASIC_INFORMATION mi{};
+  if (!VirtualQuery(p, &mi, sizeof mi) || mi.State != MEM_COMMIT) return false;
+  return (mi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE)) != 0;
+}
+bool engine_loading() {
+  if (!g_onIsLoading) return false;
+  void* impl = *reinterpret_cast<void**>(g_onIsLoading + 0x38);  // MSVC std::function: impl at +0x38
+  if (!impl) return false;
+  auto vt = *reinterpret_cast<uintptr_t**>(impl);
+  HMODULE m = nullptr;
+  if (!GetModuleHandleExW(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS | GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                          reinterpret_cast<LPCWSTR>(vt[2]), &m))
+    return false;
+  return reinterpret_cast<bool (*)(void*)>(vt[2])(impl);
+}
+// Streaming activity: the RT acceleration-structure job (renderer+0xa89c0, once per world render)
+// builds a BLAS for every object that came in since the last one (lists at scene+0x40/+0x50, counts
+// +0x48/+0x58; static, docs/stereo.md). Observed only (pass-through), on the job's worker thread.
+using AsJob_t = void(__fastcall*)(void** cap);
+AsJob_t o_asJob;
+std::atomic<uint64_t> g_last_blas_tick{0}, g_n_blas_builds{0};
+std::atomic<double> g_blas_avg{8.0};
+// The right eye's job also skips the BLAS build (+0x40/+0x50) and compaction (+0x60, count +0x68)
+// lists: the left eye's job has built them for this update (the right eye's TLAS, refits and rays use
+// those). A second build or compaction of the same new BLASes in one update looked like the
+// level-change use-after-free (compaction frees the source BLAS). stereo.as_once = 0 runs them twice.
+std::atomic<bool> g_as_once{true};
+std::atomic<uint64_t> g_n_as_skipped{0};
+void __fastcall hk_asJob(void** cap) {
+  uint8_t* sc = cap && *cap ? static_cast<uint8_t*>(*cap) : nullptr;
+  if (!sc) return o_asJob(cap);
+  auto cnt = [&](size_t off) -> uint32_t& { return *reinterpret_cast<uint32_t*>(sc + off); };
+  uint32_t n = cnt(0x48) + cnt(0x58);
+  g_n_blas_builds += n;
+  // Dynamic objects get BLAS builds every render (~7 per render in the lobby, live r17), so streaming
+  // is a burst above the usual rate: an average kept outside level changes, and "active" above 2x+8.
+  double avg = g_blas_avg.load();
+  if (!g_lc_begin.load()) g_blas_avg = avg * 0.98 + n * 0.02;
+  else if (n > 2 * avg + 8) g_last_blas_tick = GetTickCount64();
+  if (!g_as_once.load() || g_vis_phase.load() != 2 || (!n && !cnt(0x68))) return o_asJob(cap);
+  uint32_t save[3] = {cnt(0x48), cnt(0x58), cnt(0x68)};
+  cnt(0x48) = cnt(0x58) = cnt(0x68) = 0;
+  g_n_as_skipped += save[0] + save[1] + save[2];
+  o_asJob(cap);
+  const size_t offs[3] = {0x48, 0x58, 0x68};
+  for (int i = 0; i < 3; i++)
+    if (cnt(offs[i]) == 0) cnt(offs[i]) = save[i];  // the engine clears them itself at its own time
+}
+// A level change keeps the frame mono until the engine is done (signals above) and then until no
+// new geometry has streamed in (no BLAS builds) for kSettleMs, at most kChangeMaxMs after it began.
+constexpr uint64_t kSettleMs = 3000, kChangeMaxMs = 90000;
+bool level_changing() {
+  if (!g_load_mono.load()) return false;
+  uint64_t now = GetTickCount64();
+  bool busy = false;
+  if (void* jp = g_lc_jp.load()) {
+    auto* b = static_cast<uint8_t*>(jp) + 0xB8;
+    if (readable_byte(b) && (*b & 3)) busy = true;
+    else g_lc_jp = nullptr;
   }
+  uint64_t rt = g_lc_reload_tick.load();
+  if (rt && now - rt < 60000) busy = true;  // until the engine reports the load (below), at most 60 s
+  if (engine_loading()) {
+    busy = true;
+    g_lc_reload_tick = 0;
+  }
+  if (busy) {
+    if (!g_lc_begin.load()) g_lc_begin = now;
+    g_lc_tail_until = now + kSettleMs;
+    return true;
+  }
+  uint64_t b = g_lc_begin.load();
+  if (!b) return false;
+  if (now - b > kChangeMaxMs) {  // never settled: give up waiting
+    g_lc_begin = 0;
+    return false;
+  }
+  uint64_t quiet_from = std::max(g_lc_tail_until.load(), g_last_blas_tick.load() + kSettleMs);
+  if (now < quiet_from) return true;
+  TH_LOG("stereo: level change settled after %.1f s (BLAS builds so far %llu): 3D again", (now - b) / 1000.0,
+         (unsigned long long)g_n_blas_builds.load());
+  g_lc_begin = 0;
+  return false;
+}
+void level_hooks_start() {
+  const Image& exe = game_image();
+  void* uj = reinterpret_cast<void*>(exe.at(0x4823c0));
+  if (sig_match(uj, "48 8b c4 55 57 41 54 41 56 41 57 48 8d 6c 24 a0"))
+    hook_fn(uj, (void*)hk_useJp, (void**)&o_useJp, "useJumpPoint (stereo: mono during level changes)");
+  else
+    TH_LOG("stereo: useJumpPoint signature mismatch: jumps render in 3D");
+  constexpr wchar_t kCore[] = L"coregame_rmdwin10_f.dll";
+  if (void* rl = module_export(kCore,
+                               "?startReloadingEpisodeFromJumpPoint@ServerGameSession@coregame@@QEAAXAEBV?$InplaceString@$0EA@@r@@_N@Z",
+                               "stereo");
+      rl && sig_match(rl, "40 57 48 81 ec f0 00 00 00 48 c7 44 24 28 fe ff"))
+    hook_fn(rl, (void*)hk_reload, (void**)&o_reload, "startReloadingEpisodeFromJumpPoint (stereo)");
+  void* aj = reinterpret_cast<void*>(g_rimg.at(0xa89c0));
+  if (sig_match(aj, "40 55 56 41 57 48 83 ec 50 48 8b f1 33 ed 8b cd 38 0d ?? ?? ?? ?? 0f 95"))
+    hook_fn(aj, (void*)hk_asJob, (void**)&o_asJob, "RT acceleration-structure job (stereo: streaming activity)");
+  g_onIsLoading = reinterpret_cast<uintptr_t>(
+      module_export(kCore, "?onIsLoading@coregame@@3V?$function@$$A6A_NXZ@std@@A", "stereo"));
 }
 
 double eye_offset(const Params& p, int eye) {
@@ -544,8 +705,11 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
     render_eye(r, view, a3, a4, a5, p, p.mode == Mode::Left ? -1 : 1, true, -1);
     return;
   }
-  // sbs: needs a packed output and our GPU side; only the first world render of a frame.
-  if (!packed_now() || !gpu_ready() || nth != 0 || at<uint8_t>(r, kRDeviceLost)) {
+  // sbs: needs a packed output and our GPU side; only the first world render of a frame; not while
+  // the engine changes level (level_changing).
+  bool loading = nth == 0 && level_changing();
+  if (loading) g_n_load_mono++;
+  if (!packed_now() || !gpu_ready() || nth != 0 || loading || at<uint8_t>(r, kRDeviceLost)) {
     if (nth == 0) g_n_mono_fallback++;
     if (nth == 0) rt_async_hold(false);
     eyestate_mono(r);
@@ -595,9 +759,10 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
 // eye only). While our renderHUD call runs, that one allocation is made 2W wide.
 Alloc_t o_rt_alloc;
 std::atomic<int> g_hud_hdr_w{0};  // armed: the eye width
-// stereo.hdr_hud_wide (dev, default 0): live r25 the GPU stopped ~60 pairs after enabling this (the
-// renderer thread then blocked in our next copyRegion), so the HDR HUD stays in the left eye for now.
-std::atomic<bool> g_hud_wide_on{false};
+// stereo.hdr_hud_wide (default 1): the HDR UI target 2W wide during our renderHUD. The laptop's r25
+// "hang" with it was the wedged driver (VRAM); on rayblaster it ran through r3, r15 and r18 (teleports,
+// restart) with the HUD in both eyes.
+std::atomic<bool> g_hud_wide_on{true};
 std::atomic<uint64_t> g_n_hud_wide{0};
 void* __fastcall hk_rt_alloc(void* mgr, const void* init, const char* name) {
   int w = g_hud_hdr_w.load(std::memory_order_relaxed);
@@ -836,7 +1001,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -844,7 +1009,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str());
@@ -993,6 +1158,12 @@ void stereo_register() {
     } else if (id == "stereo.output") {
       g_output_req = v.empty() ? "auto" : v;
       apply_output_locked();
+    } else if (id == "stereo.as_once") {
+      g_as_once = !(v == "0" || v == "false" || v == "off");
+    } else if (id == "stereo.video_once") {
+      g_video_once = !(v == "0" || v == "false" || v == "off");
+    } else if (id == "stereo.load_mono") {
+      g_load_mono = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.rt_async_build") {
       g_rt_async_keep = truthy(v);
     } else if (id == "stereo.hdr_hud_wide") {
@@ -1107,7 +1278,8 @@ void stereo_start() {
   }
   eyestate_start(g_rimg);
   if (cfg_bool("stereo.fence_trace", false)) fence_trace_start();
-  if (cfg_bool("stereo.hdr_hud_wide", false) &&
+  level_hooks_start();
+  if (cfg_bool("stereo.hdr_hud_wide", true) &&
       !hook_fn((void*)g_rt_alloc, (void*)hk_rt_alloc, (void**)&o_rt_alloc, "RenderTargetManager::allocTexture2D"))
     o_rt_alloc = nullptr;  // only hooked when the dev option asks for it (start-up)
   if (void* vu = module_export(kRenderer, kExpVideoUpdateAsync, "stereo"); vu && sig_match(vu, kSigVideoUpdateAsync)) {
