@@ -1,6 +1,6 @@
 # Stereoscopic 3D: both eyes from one game update
 
-> **This branch (wip/stereo-hdr-level-change)**: the level-change GPU fault is fixed (`as_once`: the
+> **Status:** the level-change GPU fault is fixed (`as_once`: the
 > right eye no longer re-runs the engine's BLAS build/compaction lists; rayblaster r18, HDR, 6 teleports
 > plus a checkpoint restart with 3D on throughout). The HDR HUD is in both eyes by default
 > (`hdr_hud_wide`). See "Level-change hang".
