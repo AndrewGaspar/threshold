@@ -121,7 +121,7 @@ values = [
   { value = "ready", label = "As soon as ready" },
   { value = "smooth", label = "Smooth (even spacing; not yet measured)" },
 ]
-default = "ready"
+default = "smooth"
 apply = "live"
 
 [option."fg.camera"]

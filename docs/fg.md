@@ -1,6 +1,6 @@
 # DLSS Frame Generation / Multi Frame Generation
 
-> **Branches:** on `main`, `[fg] pace` defaults to `ready` (the measured v1 behaviour). `smooth` is
+> **This branch (wip/fg-pacing)** defaults `[fg] pace` to `smooth`. On `main`, `[fg] pace` defaults to `ready` (the measured v1 behaviour). `smooth` is
 > built but not yet A/B-measured; branch `wip/fg-pacing` makes it the default. `count = auto` is opt-in
 > and has not been run live yet (resume notes at the end).
 

@@ -173,7 +173,7 @@ struct Job {
   unsigned sync = 0, flags = 0;
   int64_t arrive_us = 0;
   int64_t step_us = 0;  // real-frame interval / multiplier
-  int pace = 0;         // 0 ready (main's default, measured), 1 smooth (wip/fg-pacing)
+  int pace = 1;         // 0 ready, 1 smooth (this branch's default; not yet A/B-measured)
   double relax = 0.5;
   uint64_t id = 0;
 };
@@ -235,7 +235,7 @@ struct State {
   int64_t last_present_us = 0;  // our last Present returned
   int64_t last_call_us = 0;     // our last Present called
   int64_t last_real_call_us = 0;  // our last real frame's Present called
-  std::atomic<int> pace{0};       // [fg] pace: 0 ready, 1 smooth
+  std::atomic<int> pace{1};       // [fg] pace: 0 ready, 1 smooth
   std::atomic<double> relax{0.5}; // [fg] pace_relax
   int64_t join_us = 0;            // the renderer thread's last wait for the present thread
   bool chain = false;             // the previous game Present was handled with frame generation
