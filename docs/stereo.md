@@ -914,13 +914,15 @@ so |L-R| shows what one eye lacks; `re/scripts/stereo_lr.py`):**
 | effect | main's behaviour (replays off) | fix | how |
 |---|---|---|---|
 | The Hiss barrier (red wall, cafeteria) | pixels with \|L-R\| > 12/255: 3354, 11786; the right eye's barrier plain red without its structure | **0, 0**; at 32.5 mm the barrier's disparity in the right eye matches the left's: -22 px, mean \|diff\| 2.28 (6.31 off) | measured, r2 (record replay only; that effect needs no offscreen pass) |
-| Launch / aim targeting outline (white outline on the chair under the reticle, cafeteria fight) | 3836-4408 px, the outline in the left eye only (r9, 7 and 3 captures) | **0** (r9 8 captures, r10 6 captures); at 32.5 mm the right eye's outline follows the chair in that eye (crop `st_k_chair.png`) | measured, r8-r10; needs the declare replay: with only the record replay (and an RT-object restamp tried on the way, dropped) the outline stayed left-only (r6, `ch3`) |
+| Launch / aim targeting outline (white outline on the chair under the reticle, cafeteria fight) | 3836-4408 px, the outline in the left eye only (r9, 7 and 3 captures) | **0** (r9 8 captures, r10 6 captures; the build merged with main dc0f24c, r13: 12 captures while firing, against 4176-4341 px in 8 of 12 with the replays off, r12); at 32.5 mm the right eye's outline follows the chair in that eye (crop `st_k_chair.png`) | measured, r8-r10; needs the declare replay: with only the record replay (and an RT-object restamp tried on the way, dropped) the outline stayed left-only (r6, `ch3`) |
 | Jesse's damage effect (red vignette with ink-like distortion) | mean \|L-R\| 17.8/255, 938k px: the right eye's vignette plain (r9 `s1_v0_3`) | identical (r8 `ol`, r10 combat frames: \|L-R\| 0.02-0.2, residue in dust and smoke) | measured |
 | Hiss enemies' effects | the white "steam" next to an enemy was in both eyes even with the replays off (r9 `f1`, `s1`), so it is not a GfxGraph effect; no damage/cloak effect on an enemy was captured | the fight's frames match between the eyes (r10 `s3`) | live, partial |
 | Polaris | not found on screen in the lab (both saves; GfxGraph lists were non-empty at Dead Letters and the cafeteria) | | not reproduced |
 | Video overlays (Trench, the Board) | not reached (story scenes) | | static only: 0x4ea30 starts the video streamers of textures GfxGraph commands use, i.e. GfxGraph effects play videos; the lobby's world video source (`stereo status` `video.active` 1) shows no \|L-R\| with `video_once` on (r10), so the right eye's skipped decode is not what blanks a video |
 
-No GPU fault (no Xid in the kernel log over r6-r10, many teleports and deaths in the fight).
+| Service Weapon firing (a "rainbow smear by the gun" was seen left-only in another agent's capture on main) | 22 captures while firing (r11 single shots, r12 held fire): no left-only pixels at the gun (all differences are the outline's box) | r13: 0 | live; the smear was not caught in a capture, so not reproduced |
+
+No GPU fault (no Xid in the kernel log over r6-r13, many teleports and deaths in the fight).
 
 **Open.** Compute dispatches in the declared list now run once per eye, i.e. twice per update; if a
 GfxGraph effect simulates in a compute pass it advances twice per update in 3D (dust and smoke in the
