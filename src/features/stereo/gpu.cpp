@@ -390,6 +390,7 @@ void issue(ID3D12GraphicsCommandList* cl, UINT count, UINT start, INT base, F&& 
   d.vp_x = t_vp.TopLeftX, d.vp_y = t_vp.TopLeftY, d.vp_w = t_vp.Width, d.vp_h = t_vp.Height;
   d.dx = dup ? g_dup_dx.load() : 0;
   if (cb) cb(cl, 0, d);
+  if (d.skip) return;
   bool moved = d.shift[0] != 0 || d.shift[1] != 0;
   if (!dup) {
     issue_at(cl, d.shift[0], 0, 0, draw);

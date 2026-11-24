@@ -401,26 +401,27 @@ ShapeEngine then draws that texture full screen (one 6-index draw outside the UI
 swapping the texture's content around that draw's right-half copy changes the right half's
 background), and the Coherent menu composites over it. With the 2W back buffer the copy took the left eye only, and the
 mono duplicate showed it in both eyes.
-- Slot 22 hooked: after the engine's copy, the right eye (the back buffer's [W, 2W)) goes into a
-  texture of ours, and the left one is saved too.
-- Paused frames (no pair, a capture of this pause active) run `renderHUD` over the side-by-side
-  texture with the draw duplication armed, like a pair; for the background draw's right-half copy,
-  the right eye's capture is copied into the game's texture first and the left one copied back after
-  (on the engine's list, around that one draw). The menu is drawn twice at the same position: the
-  screen plane. `end` blits it like a pair.
-- `renderHUD` must leave +0x3c8 pointing at the side-by-side texture for `end` (r6-r11 restored it
-  to null as the pair path does for its own texture; `end` then blitted nothing and the stale back
-  buffer showed: no menu). Also, in the pause path only, the 2W pool depth-stencil
-  ("pHudDepthStencil") is cleared to the engine's values (depth 1, stencil 0) when renderHUD
-  allocates it, as renderHUD does for a colour target it creates (`hud_ds_clear`); added while
-  bisecting r11, not shown to be needed on its own.
-- Ends at the next pair, at a load (quit to menu), or if the game's texture changes.
-- `output = hsbs`: the W-wide back buffer holds both eyes squeezed, so the engine's own copy was the
-  squeezed pair in each eye (r14: a double image under the menu, on main too). Both eyes are taken
-  from the side-by-side texture instead (the frame before `end`'s gamma blit): measured r15, the
-  pause dims the wall to 0.599 of the world's brightness against 0.600 with `full` (r12), so the blit
-  is an identity here (SDR, default brightness; HDR not tested); disparity -7.89 vs -7.70 squeezed
-  px in the world (engine at 3840 per eye on that display).
+Since the laptop freeze (below) the design is (branch `wip/stereo-ui-pause-fix`):
+- Slot 22 is hooked only to note the capture; nothing is allocated, copied or written there.
+- The side-by-side texture keeps the last pair: frames without a pair (menus, videos, the first
+  paused frames) are duplicated into a second 2W texture (`Threshold::stereoMonoDuplicate`) instead
+  of over it.
+- The first paused frame (no world render after a capture) copies the side-by-side texture, i.e. the
+  last pair with its HUD as presented minus `end`'s gamma blit, into one 2W texture of ours, at the
+  start of `renderHUD`, where the pair path also allocates and copies.
+- Paused frames run `renderHUD` over the side-by-side texture with the draw duplication armed, like a
+  pair. `renderHUD` first clears it (+0x474 and +0x475 are both 1 in these frames, live r20); the
+  engine's background quad (the first full-screen 6-index draw outside the UI backend) is skipped in
+  both halves and our copy is put in its place, on the engine's list at that point, so the menu
+  composites over both eyes. The menu is drawn twice at the same position: the screen plane. `end`
+  blits it like a pair. No game texture is written.
+- Ends at any world render, at a load (`onIsLoading`), and after 30 paused frames in a row without the
+  background draw (the first paused frames draw nothing at all, live r5).
+- `output = hsbs` needs nothing special now: both eyes come from the side-by-side texture, 1:1.
+- Brightness: the copy is the pre-gamma frame and the engine's background was the back buffer. The
+  pause dims the wall to 0.600 (`full`, r21) / 0.599 (`hsbs`, r19) of the world's brightness, as the
+  engine's own pause did (0.600, r12), so `end`'s blit is an identity here (SDR, default brightness;
+  HDR not tested).
 
 Measured (r12, lobby, the same capture conditions; `stereo_disparity.py` per half):
 
@@ -432,7 +433,32 @@ Measured (r12, lobby, the same capture conditions; `stereo_disparity.py` per hal
 | r13, 2x FG: in the world / paused | | -18.68 / **-18.69 px** | menu in both halves (screenshot) |
 | r16 (final build) / r17 (merged with main), paused | | **-18.11 / -18.14 px** | 0.00/255 both |
 
+| `wip/stereo-ui-pause-fix` (r21 `full`, control-ui), in the world / paused | | -18.08 / **-18.12 px** | 0.00/255 |
+| `wip/stereo-ui-pause-fix` (r19 `hsbs`, control-ui1080: 1920x1080, DLSS Balanced 1114x626), world / paused | -8.44 / **-8.48 px** (squeezed) | | 0.00/255 |
+
 The menu is identical in both halves; the background keeps the world's disparity field.
+
+**The laptop freeze (2026-11-23, main 5324374, v5).** The user's game froze for good right after
+`stereo ui: pause background captured per eye (1920x1080 format 20)`, the run's first capture, on
+picking up a memo (`output = hsbs`, FG off, DLSS Balanced, RTX 5070 Laptop 8 GB): no present after it,
+GPU idle, one `vkd3d_queue` thread waiting on a timeline value nobody signals (a wait-before-signal on
+the GPU side, no Xid).
+- **Not reproduced in the lab.** The document reader never opened there: three documents picked up at
+  the `game-start` story point (hub security desk, NSC control room twice; rayblaster
+  `control-ui`/`control-ui1080` r1-r3) were collected without a reader and without a capture; Esc
+  pause in `hsbs` at the user's resolution and DLSS mode, three times in a row, did not hang (r2).
+  The capture's caller is the same for every menu (`Control_DX12.exe+0x568f70`, "Screen shot
+  texture", static; live caller `exe+0x5690f2` for Esc, r4), so the reader's capture is the same call.
+- **What main's capture path did that the reader can reach and Esc did not:** inside slot 22 it
+  allocated two pool render targets and recorded three copies, in `hsbs` from the side-by-side
+  texture pointer saved at the last pair (`end` reallocates that texture when a frame's colour target
+  changes format: a dangling pointer if a frame without a pair came between); and on every paused
+  frame it copied textures into the game's "Screen shot texture" around every draw outside the UI
+  backend (one per frame for Esc; unknown for the reader). It also kept the pause state through
+  loads (r5: 1557 paused-path frames during a teleport's load, ended only by the next pair). The
+  rework removes all of these; which one hung the laptop is not established.
+- **Also found:** a frame without a pair before the capture had overwritten the side-by-side texture
+  with the mono image (the first rework drew a black background, r18-r20), hence the mono texture.
 
 ## Stereo with frame generation
 
