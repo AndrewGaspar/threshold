@@ -167,6 +167,21 @@ constexpr char kSigRtFreeDepth[] = "40 56 57 41 56 48 83 ec 30 48 c7 44 24 20 fe
 constexpr char kExpVideoUpdateAsync[] = "?updateAsync@VideoStreamerFactory@rend@@QEAAXMW4VideoLocation@2@@Z";
 constexpr char kSigVideoUpdateAsync[] = "48 89 5c 24 10 57 48 83 ec 50 80 3d ?? ?? ?? ?? 00 41 0f b6 d8";
 
+// GfxGraph effects (the game's node-graph VFX: Polaris, the Hiss' damage / cloak / shield effects;
+// static, renderer). rend::GfxGraphEngine (instance renderer+0x802898) keeps
+// +0x38 GfxGraphRenderToPassCommand* and +0x48 GfxGraphDrawParticleSystemsCommand* (r::Vector
+// {data, u32 count, u32 capacity | flags}), appended on the render thread by the RendererThreading
+// messages of GfxGraphEngineWrapper::addRenderToPassCommand / addDrawParticleSystemsCommand
+// (handlers 0x4a6f0 / 0x4a7c0, gated by "GfxGraph:Enable"). The world render's pass 0x13e3a0 (after
+// the particles' light pass, the flares and the decals) calls 0x4eb80 ("GfxGraphEngine" event): it
+// records every render-to-pass command into the render's draw buckets and every particle-system
+// command through ParticleEngine::recordCommandsForLightPass, and then sets both counts to 0.
+// The commands live in the game-frame allocator until frame end (FrameEndReleaser), so they are
+// still valid for the second render of the update.
+constexpr uintptr_t kRvaGfxGraphRecord = 0x4eb80;
+constexpr char kSigGfxGraphRecord[] = "48 8b c4 48 89 50 10 55 41 56 41 57 48 8d 68 a8 48 81 ec 40 01 00 00";
+constexpr size_t kGfxEngRenderToPass = 0x38;  // then +0x48, 0x10 bytes apart
+
 // "rtd:Enable async build" (bool tweakable value, default 1; static: its constructor renderer+0x3b10):
 // with it the RT acceleration structures are built by a job on the async compute queue, fenced
 // against graphics once per world render (renderer+0x124158 signal, +0xa8bf0 compute wait / signal,

@@ -1049,6 +1049,50 @@ waits never satisfied as `STUCK`.
   surface probe is 3 HUD passes old (a fast turn can use a stale surface for a few frames).
   HypXRland not tested (the user's display).
 
+### Resume notes: left-eye-only effects (2026-11-23, branch `wip/stereo-polaris`, UNVERIFIED for merge)
+
+User reports (HypXRland, main 5324374): Polaris, the Hiss enemies' damage/cloak "steam", the Launch
+targeting outlines and the Trench/Board video overlays render in the left eye only.
+
+- **Cause found (GfxGraph effects; static + live).** `rend::GfxGraphEngine` (instance
+  renderer+0x802898) keeps +0x38 render-to-pass commands and +0x48 particle-system commands, filled
+  once per update on the render thread by RendererThreading messages (handlers renderer+0x4a6f0 /
+  +0x4a7c0). Each world render's pass renderer+0x13e3a0 calls renderer+0x4eb80 ("GfxGraphEngine"
+  event), which records both lists into that render's draw buckets and then sets both counts to 0
+  (static). So the right eye found them empty. Live (rayblaster `control-polaris` r2, new counters
+  `gfx` in `stereo status`): Dead Letters, replay off: per ~3 s, left 205 commands / 205 particle
+  commands, right **0 / 0**; the pass itself runs once per eye (calls 844 / 843).
+- **Fix (in this branch):** hook renderer+0x4eb80 (signature-checked, engine.h
+  `kRvaGfxGraphRecord`); the left eye's lists are kept and written back for the right eye (the
+  commands live in the game-frame allocator until frame end). Dev switch `[stereo] gfxgraph_replay`
+  (live, default 1).
+- **Verified so far (live, measured, r2):** cafeteria, the red Hiss barrier (a GfxGraph effect):
+  separation 0, |L-R| pixels > 12/255 in the barrier: replay off 3354 and 11786 (two captures),
+  replay on **0 and 0**; at 32.5 mm the barrier in the right eye matches the left at -22 px with
+  mean |diff| 2.28 (off: 6.31); the planter in front -17 px both ways. Captures:
+  `~/.cache/quiver/remote/rayblaster/lab/instances/control-polaris/lab/runs/r2/stereo_*_cafw_*`,
+  `*_cafs_*` (and `cafs_on_pair.png` / `cafs_off_pair.png` crops). No GPU fault seen.
+- **Not yet verified:** Polaris itself (not located on screen; the GfxGraph lists were non-empty at
+  Dead Letters and the cafeteria only), Hiss enemy VFX in combat, Launch outlines, video overlays.
+- **Outlines:** the "ObjectHighlight - Execute" pass (renderer+0x9fa20, called from +0x13ecf0)
+  draws the bucket at render-internal+0x300 into its own texture with the current view; whether that
+  bucket is filled by GfxGraph render-to-pass commands (then fixed too) or by a consumed per-update
+  list is open. Test: Launch aimed at a throwable (key binding not established; the save is before
+  the Hotline, Launch may not be unlocked yet).
+- **Video overlays:** `hk_videoUpdate` skips the right eye's `VideoStreamerFactory::updateAsync`
+  (video_once). `VideoStreamer::sample` (renderer+0x17c780) uploads Bink planes into a buffer ring
+  (`this+0x184`) and converts in FUN_18017d3d0; if the output is per render, the skip could blank the
+  right eye. This branch adds `stereo status` `video` {active sources, VideoLocation mask} to find a
+  world video (live survey: `entry-lobby` has 1 active source; directors-office, executive-corridor, upper-offices, mail-room, hotline-chamber 0); then A/B `stereo.video_once = 0` in the entry lobby. It may also be a GfxGraph effect (then fixed).
+- **Lab.** rayblaster instance `control-polaris` (1920x1080, GE-Proton11-12-x86_64, the user's
+  renderer.ini, `reload_pattern`/`log_file` set). Fixture `unknown-caller` = the user's save copied
+  read-only (Unknown Caller, "Enter the Communications Dept."). Launch with `tools/lab/continue
+  control-polaris --mod DIR` (DIR from `tools/lab/moddir DIR stereo.mode=sbs stereo.output=full
+  stereo.ui_pause=0`). Hub locations with GfxGraph activity: `dead-letters`, `cafeteria` (the barrier
+  is ~300 px left of the start view after turning 5x60 degrees right).
+- **Next.** Find Polaris / Hiss in combat / Launch / a world video; A/B each with `gfxgraph_replay`
+  (and `video_once`) at separation 0 (|L-R|) and 32.5 mm; then document, merge to main, push.
+
 ## Reproducing
 
 ```sh
