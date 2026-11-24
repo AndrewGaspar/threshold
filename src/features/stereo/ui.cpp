@@ -265,6 +265,7 @@ void probe_markers(ID3D12GraphicsCommandList* cl) {
 struct Pause {
   bool pending = false;  // a capture happened; the next pause frame takes the side-by-side copy
   bool active = false;   // paused frames draw the per-eye copy
+  int pairs_since = 0;   // world renders since the capture while pending
   void* tex = nullptr;   // our Texture2D (2W x H, the side-by-side texture's format)
   int w = 0, h = 0, fmt = -1;
 } g_pause;
@@ -301,6 +302,7 @@ void __fastcall hk_capture(void* r, void* tex2d) {
   o_capture(r, tex2d);
   g_pause.active = false;
   g_pause.pending = g_pause_on.load() && g_f_ok && g_f.pack != 0;
+  g_pause.pairs_since = 0;
   if (g_pause.pending) {
     g_n_capture++;
     TH_LOG("stereo ui: pause capture (frame %llu): the next frame without a pair takes both eyes",
@@ -420,7 +422,13 @@ void ui_frame(const UiFrame& f) {
   g_f_ok = f.w > 0 && f.m00 > 0;
 }
 
-void ui_pair_rendered() { pause_end("a world render"); }
+// A world render ends an active pause background. A capture still pending survives a short run of
+// world renders: the collectibles menu captures as it opens and keeps rendering the world while it
+// animates in, then stops (live r22-r24); the frozen background is then the last pair before the stop.
+void ui_pair_rendered() {
+  if (g_pause.active) pause_end("a world render");
+  else if (g_pause.pending && ++g_pause.pairs_since > 240) pause_end("the world kept rendering after the capture");
+}
 void ui_pause_cancel(const char* why) { pause_end(why); }
 
 bool ui_pause_sbs() {
