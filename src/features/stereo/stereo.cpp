@@ -1359,7 +1359,7 @@ void stereo_register() {
       g_rt_async_keep = truthy(v);
     } else if (id == "stereo.hdr_hud_wide") {
       g_hud_wide_on = truthy(v);
-    } else if (id == "stereo.ui_markers" || id == "stereo.ui_pause") {
+    } else if (id == "stereo.ui_markers" || id == "stereo.ui_pause" || id == "stereo.ui_reticle") {
       ui_option(id, v);
     } else if (id == "stereo.hyprland_tag") {
       g_tag_on = !(v == "0" || v == "false" || v == "off");
@@ -1405,6 +1405,17 @@ void stereo_register() {
       return json_str(std::string(r ? "set " : "failed ") + name + " = " + a.back());
     }
     if (sub == "graph") return eyestate_graph();
+    if (sub == "ui" && a.size() > 1 && a[1] == "shot") {  // ui shot TAG: a HUD dump and the frames around it
+      std::lock_guard lk(g_cmu);
+      g_shots_left = 2;
+      g_shot_tag = a.size() > 2 ? a[2] : "ui";
+      g_shot_skip = 0;
+      const char* d = getenv("QUIVER_LAB_RUN_DIR");
+      g_shot_dir = d ? d : ".";
+      g_shot_files.clear();
+      std::vector<std::string> dump = {"ui", "dump", "1"};
+      return ui_verb(dump, ok);
+    }
     if (sub == "ui") return ui_verb(a, ok);
     if (sub == "fences") {
       fence_dump(a.size() > 1 ? atoi(a[1].c_str()) : 300);

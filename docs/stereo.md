@@ -50,6 +50,7 @@ left, right eye right, the HUD hint in both halves.*
 | Level change (jump point / teleport, checkpoint restart) while in sbs | fixed (`as_once = 5`: the right eye skips the left eye's BLAS builds/compactions and runs its own new builds; `load_mono`: mono until streaming settles) | live, rayblaster r18/r19 (RT on, old as_once), r43 (22 teleports, RT reflections), "Level-change hang" |
 | Ordinary play with RT on in sbs (the in-world GPU fault) | fixed (`as_once = 5`) | live, rayblaster r41/r42 (14 and 10 min in the world, every earlier 3D run faulted within ~3 min) |
 | World-anchored HUD markers (interaction / collectible prompts, mission markers) at the depth of what they mark, or just in front of the surface hiding it (`ui_markers`) | done | measured, rayblaster `control-ui` r6, r12, r13, "The UI layer" |
+| Crosshair at the aim ray's hit depth (`ui_reticle`); enemy health bars and nameplates at the enemy's depth (`ui_markers`) | done | measured, rayblaster `control-ui`, "The reticle", "Enemy health bars" |
 | Pause menu over a per-eye background, the menu at the screen plane (`ui_pause`) | done (`full`/`sbs`; `hsbs` too, from the side-by-side texture) | measured, rayblaster `control-ui` r12 (and r13 with 2x FG), "The UI layer" |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
@@ -393,6 +394,69 @@ Off-screen interaction markers are not drawn by the game (r12: the projection cl
 appears). No mission marker was on screen at the `game-start` story point, so mission markers and
 edge arrows were not seen live; they go through the same projection and composite path (static).
 
+**Enemy health bars and nameplates** (`ui_markers`; branch `wip/stereo-reticle`). The enemy status
+widget (`UIHudEnemyStatus`, `m_vecHealthBarPos`, exe+0x5fe3c0, static) does not use the HUD projection
+above but `coregame::CameraComponentState::worldToScreen` (normalized 0..1 result; the Vector2
+overload at coregame+0xbcd50 calls the bool one at +0xbcd80, which is hooked). On-screen results join
+the markers (off-screen ones are not drawn by the game). A moving enemy projects a new point every
+update, so markers are now one per anchor within 0.5 m (the newest), the surface probes are matched to
+anchors within 0.75 m, and draws are matched by their quad's centre (texture size times the
+Transform's scale, at its translation), within 64 px (x) / 80 px (y) of an anchor: live, the health bar
+layer (128x128, with the level shield and the bar) is centred ~25 px right of and ~35 px above its
+point, an interaction icon ~30 px right of and ~45 px below its anchor.
+
+Measured (rayblaster `control-ui`, `unknown-caller` save, Research Sector lobby, Hiss soldiers, `full`,
+32.5 mm, 4 m; `stereo ui shot TAG`: a HUD dump and the two frames around it, so the disparity of the
+captured bar is compared with the shift chosen in the same frame; the bar's orange pixels' centroid
+per half):
+
+Interaction marker after the matching change (same capture method, NSC control room): -12.78 / -11.96
+px against applied -12.76 / -11.94.
+
+| frame | the enemy's anchor | chosen depth | applied shift sum (px) | bar disparity L-R (px) |
+|---|---|---|---|---|
+| h4 | 13.9 m, visible | 13.9 m | -20.64 | **-20.41, -20.52** |
+| h2 / h3 | 14.6 m, behind Jesse (surface 1.5 m) | 1.5 m (just in front of her) | +46.64 / +48.98 | **+47.73 / +49.00** |
+| h6 | 12.4 m, behind a bush (surface 4.6 m) | 4.5 m | -2.94 | **-2.59, -2.88** |
+| h5 | 12.5 m, under the crosshair | the reticle's depth | -21.88 | **-21.94** |
+
+An enemy behind the player's own body puts its bar in front of her (the first surface on the ray from
+the camera, as specified); as she moves across the ray the bar steps between the two depths.
+
+**The reticle** (`ui_reticle`, default on; branch `wip/stereo-reticle`). Control's crosshair
+(`UIHudCrosshair`; its model, `CrosshairData`, has a type, sizes, dispersion and kickback but no
+position: static) is drawn at the screen centre (live: its 384x384 and 256x128 layers composited at
+half scale, centred 12 px and 1 px right of (W/2, H/2), the second 72 px below it), so the aim ray is
+the centre camera's ray through the screen centre. Following Pharos's bow and Senu reticles
+(`~/code/ac-dlss/docs/STEREO.md`, "Predator Bow and tracked markers"):
+- the ray is sampled in the left eye's linear depth at 32 points, where ray points at log-spaced
+  depths (0.4 to 400 m, 25 % apart) appear in that eye; the hit is the nearest sample whose surface
+  is at or in front of its ray point, with 1/z interpolated between it and the previous sample; read
+  back with the marker probes (3 frames late);
+- the shown depth snaps to a nearer hit and eases to a farther one (a quarter of the 1/z gap per
+  frame), so an occluder passing the centre does not make the crosshair jump back and forth;
+- every layer composited into the side-by-side target whose quad is centred within 32 px (x) / 120 px
+  (y) of the screen centre, at most 400 px and 512x512 texels, gets the reticle's shift, before the
+  marker matching: the crosshair, its spread arc and the charge rings (and an enemy bar right under the
+  crosshair, whose depth is then the ray's hit, i.e. that enemy);
+- no aim eye: Pharos's `aim_eye` places a sight held up to one eye (the Predator bow's first-person
+  scope) on that eye's axis. Control's camera is third person over Jesse's shoulder, the crosshair is a
+  screen overlay on the camera's ray, and no weapon form has a scope, so both eyes take the ray's hit
+  depth.
+
+Measured (maintenance NSC control room, `full`; `stereo_marker.py` on the diamond's bright pixels
+against scene patches next to it; four aim directions, two runs):
+
+| aim | hit depth | crosshair L-R | scene next to it |
+|---|---|---|---|
+| a1 | 9.77 m | -16.65 px | -17.05, -16.86 px |
+| a2 | 8.33 m | -15.10 px | -15.43, -14.73, -15.05 px |
+| a3 | 8.88 m | -15.37 px | -15.90, -16.44, -16.02 px |
+| a4 (a dark, featureless wall) | 7.35 m | -12.39 px | -13.13, -13.32 px |
+| before (main) | screen plane | 0 px | |
+
+The spread arc moves with it (-17.54, -15.35, -16.07 px in a1-a3).
+
 **Pause background.** `renderHUD`'s pause frames (no world render) draw the menu over a frozen
 frame. That frame is RendererX86 slot 22 (renderer+0x135840, static): it copies the back buffer at
 (viewport offset, the texture's size) into a game-owned texture, once, on the frame the menu opens
@@ -669,6 +733,7 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
 | `ui_markers` | 1 | world-anchored HUD markers at their depth (or in front of what hides them); 0 = screen plane. Live |
+| `ui_reticle` | 1 | the crosshair at the depth the aim ray (the screen centre) first meets; 0 = screen plane. Live |
 | `ui_pause` | 1 | the pause menu's background per eye. Live (from the next pause) |
 | `hdr_hud_wide` (dev) | 1 | start-up: HDR UI target allocated 2W so the HUD reaches both eyes (r3, r15, r18) |
 | dev: `rand_replay`, `convergence_shift`, `test_pan` | 1, 1, 0 | rand replay; image-shift convergence in sbs (0 = projection; with frame generation always the projection); synthetic yaw °/update |
@@ -1123,4 +1188,4 @@ The 3840x1080 display tests used `quiver lab create gog:2049187585 --name contro
 --display 3840x1080@60 --exe Control_DX12.exe` (renderer.ini `m_eWindowMode` 0 windowed, 1
 borderless, 2 exclusive; output 1920x1080).
 
-Lab verbs: `stereo status | hyprland | census N | shots N TAG [SKIP] | files | probe N | graph | grab KIND I [TAG] | fences N | ui [status|dump N]`.
+Lab verbs: `stereo status | hyprland | census N | shots N TAG [SKIP] | files | probe N | graph | grab KIND I [TAG] | fences N | ui [status|dump N|shot TAG]` (`ui shot`: a HUD dump and the two presented frames around it).
