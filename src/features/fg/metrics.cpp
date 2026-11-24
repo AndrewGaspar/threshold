@@ -54,18 +54,18 @@ void metrics_init() {
       "{\"value\":\"off\",\"label\":\"off\",\"level\":\"dim\"},{\"value\":\"on\",\"label\":\"on\"},"
       "{\"value\":\"auto\",\"label\":\"auto\"},{\"value\":\"idle\",\"label\":\"no input\",\"level\":\"dim\"},"
       "{\"value\":\"failed\",\"label\":\"failed\",\"level\":\"bad\"}],"
-      "\"display\":\"badge\",\"group\":\"Frame generation\",\"order\":1,\"level\":\"basic\"");
+      "\"display\":\"badge\",\"roles\":[\"fg.state\"],\"group\":\"Frame generation\",\"order\":1,\"level\":\"basic\"");
   g.mult = metric_declare("fg.multiplier", QUIVER_GAUGE,
       "\"label\":\"FG multiplier\",\"help\":\"Presents per rendered frame now ([fg] count, or what count = auto chose); "
       "1 while no frames are generated.\",\"unit\":\"x\",\"format\":{\"precision\":0},\"sample\":2,"
-      "\"group\":\"Frame generation\",\"order\":2,\"level\":\"basic\"");
+      "\"roles\":[\"fg.ratio\"],\"group\":\"Frame generation\",\"order\":2,\"level\":\"basic\"");
   g.real = metric_declare("fps.real", QUIVER_GAUGE,
       "\"label\":\"Rendered FPS\",\"short\":\"BASE\",\"help\":\"Frames the game rendered per second (each shown once, "
       "after its generated frames).\",\"unit\":\"fps\",\"format\":{\"precision\":0},\"better\":\"higher\",\"sample\":2,"
-      "\"group\":\"Frame generation\",\"order\":3,\"level\":\"basic\"");
+      "\"roles\":[\"fps.base\"],\"group\":\"Frame generation\",\"order\":3,\"level\":\"basic\"");
   g.gen = metric_declare("fps.generated", QUIVER_GAUGE,
       "\"label\":\"Generated FPS\",\"short\":\"GEN\",\"help\":\"DLSS-G frames presented per second.\",\"unit\":\"fps\","
-      "\"format\":{\"precision\":0},\"sample\":2,\"group\":\"Frame generation\",\"order\":4,\"level\":\"basic\"");
+      "\"format\":{\"precision\":0},\"sample\":2,\"roles\":[\"fps.generated\"],\"group\":\"Frame generation\",\"order\":4,\"level\":\"basic\"");
   g.dropped = metric_declare("fg.dropped", QUIVER_COUNTER,
       "\"label\":\"Generated frames dropped\",\"help\":\"Generated frames not shown: DLSS-G wasn't done within 100 ms, "
       "or the next frame was already waiting.\",\"unit\":\"count\",\"better\":\"lower\",\"group\":\"Frame generation\",\"order\":6,\"level\":\"advanced\"");
@@ -73,8 +73,8 @@ void metrics_init() {
       "\"label\":\"Reflex (injected)\",\"short\":\"RFX\",\"values\":[{\"value\":\"off\",\"label\":\"off\",\"level\":\"dim\"},"
       "{\"value\":\"on\",\"label\":\"on\"},{\"value\":\"boost\",\"label\":\"boost\"}],\"display\":\"badge\","
       "\"group\":\"Latency\",\"order\":7,\"level\":\"advanced\"");
-  // Per-present records (SIGHT-HUD 3.10): Quiver refuses ring kinds until it offers mod rings, and
-  // quiver_perf_wanted() is 0 until then, so metrics_present submits nothing today.
+  // Per-present records (SIGHT-HUD 3.10, 3.18): with quiver_mod.h 3.1 the SDK maps a frame ring once
+  // Quiver grants one, and quiver_perf_wanted() turns 1; records then count as the mod's frames.
   g.frame = metric_declare("frame", QUIVER_FRAME,
       "\"label\":\"FG presents\",\"help\":\"One record per Present Threshold makes: generated, real after generated, "
       "or real alone.\",\"clock\":\"qpc\",\"key\":\"present_seq\",\"fields\":[\"game_present\",\"present_call\","

@@ -283,6 +283,7 @@ apply = "live"
 # The fg.* / fps.* / reflex.mode / frame metrics exist only with [fg] enabled.
 
 [metric."fg.state"]
+roles = ["fg.state"]
 kind = "state"
 label = "Frame Generation"
 short = "FG"
@@ -300,6 +301,7 @@ order = 1
 level = "basic"
 
 [metric."fg.multiplier"]
+roles = ["fg.ratio"]
 kind = "gauge"
 label = "FG multiplier"
 help = "Presents per rendered frame now ([fg] count, or what count = auto chose); 1 while no frames are generated."
@@ -311,6 +313,7 @@ order = 2
 level = "basic"
 
 [metric."fps.real"]
+roles = ["fps.base"]
 kind = "gauge"
 label = "Rendered FPS"
 short = "BASE"
@@ -324,6 +327,7 @@ order = 3
 level = "basic"
 
 [metric."fps.generated"]
+roles = ["fps.generated"]
 kind = "gauge"
 label = "Generated FPS"
 short = "GEN"

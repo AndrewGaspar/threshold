@@ -546,3 +546,13 @@ Done: 7 (headroom cap, default off), 8 (latency), 9 (Reflex injection, default o
 measured effect at these frame rates). Instance `control-fg` on rayblaster is down, back on the
 standard scene settings (SDR 1920x1080@165, render 1280x720, RT off). Commands as before (`tools/fg/launch`, `tools/lab/rb
 tools/fg/fg-series`, `tools/lab/rb tools/fg/latency-series`, `tools/fg/latency-table.py`).
+
+### HUD numbers without Reflex (Quiver ec0ff90, quiver_mod.h 3.1)
+
+Threshold's `fg.state`, `fg.multiplier`, `fps.real` and `fps.generated` claim Quiver's stand-in roles
+(`fg.state`, `fg.ratio`, `fps.base`, `fps.generated`), and the SDK header is 3.1, so the `frame`
+metric is accepted and `quiver_frame_submit` writes each present to Quiver's frame ring (design/SIGHT-HUD.md
+3.18). Live (rayblaster `control-hud` r6, mono 4x, `[fg] reflex = off`, `QUIVER_LAB_HUD=full`): the
+log reads `metrics accepted: ... frame; refused: (none)`, and the HUD shows `152 BASE (Threshold)`,
+`FG 4.0x (Threshold)` and the Threshold strip (`FG on 4x BASE 149`) at 608 presented fps. Quiver's
+own Reflex count still wins when Reflex is on.

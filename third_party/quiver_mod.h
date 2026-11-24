@@ -24,7 +24,8 @@
  *  - Never returns NULL; every function accepts NULL and the no-op handle.
  *  - All strings are UTF-8. Invalid UTF-8 is replaced, text values are cut at 48 bytes.
  *
- * Threads: quiver_gauge/count/state/text/mark may be called from any thread at any rate.
+ * Threads: quiver_gauge/count/state/text/mark/frame_submit/sample may be called from any
+ * thread at any rate.
  * Callbacks run on the SDK thread, or, with QUIVER_POLL, inside quiver_poll() on your
  * thread. quiver_open() is safe in DllMain(DLL_PROCESS_ATTACH); quiver_close() is not
  * meant for DllMain (at process exit, just don't call it).
@@ -44,7 +45,7 @@ extern "C" {
 #endif
 
 #define QUIVER_MOD_PROTOCOL 3
-#define QUIVER_MOD_SDK "quiver_mod.h 3.0"
+#define QUIVER_MOD_SDK "quiver_mod.h 3.1"
 
 typedef struct quiver_mod quiver_mod; /* opaque */
 
@@ -132,8 +133,8 @@ typedef int32_t quiver_metric; /* small index; < 0 = invalid */
 typedef enum quiver_kind {
     QUIVER_GAUGE = 1, /* a number, latest wins (fps, ms, %) */
     QUIVER_COUNTER,   /* monotonic count; Quiver shows a rate */
-    QUIVER_SERIES,    /* per-event samples: needs a ring (not in this Quiver yet) */
-    QUIVER_FRAME,     /* per-frame records: needs a ring (not in this Quiver yet) */
+    QUIVER_SERIES,    /* per-event samples (quiver_sample): through the shared-memory ring */
+    QUIVER_FRAME,     /* per-frame records (quiver_frame_submit): through the ring */
     QUIVER_STATE,     /* one of the descriptor's declared values ("on", "off") */
     QUIVER_TEXT,      /* short text ("DLSS K", "1280x800") */
     QUIVER_EVENT      /* marks on a timeline (quiver_mark) */
@@ -161,10 +162,21 @@ void quiver_text(quiver_mod *m, quiver_metric h, const char *utf8);   /* <= 48 b
 void quiver_mark(quiver_mod *m, quiver_metric h, int64_t t_qpc, int64_t dur_qpc, const char *label);
 int64_t quiver_now(void); /* QueryPerformanceCounter */
 
-/* Per-frame data (SIGHT-HUD phase 2: shared-memory rings, whose layout is quiver-perf's
- * include/quiver_perf.h; this header will include it then). Declared so mods can be written
- * against them now; until Quiver offers rings they drop everything (counted), and
- * quiver_perf_wanted() returns 0. */
+/* Per-frame data (3.1; Quiver's design/SIGHT-HUD.md sections 3.8 and 3.18). Under a Quiver
+ * that offers rings (the `rings` capability), the SDK thread asks for one once a frame or
+ * series metric is accepted, and maps it (CreateFileW + MapViewOfFile on the file Quiver
+ * made in the session's shared-memory dir; layout: quiver-perf's include/quiver_perf.h).
+ * From then on quiver_frame_submit and quiver_sample write one 128-byte record each, lock-
+ * and syscall-free; before that (or under an older Quiver, which refuses frame and series
+ * metrics) they drop the record and count it in quiver_stats.dropped.
+ *
+ * Frame generation: give every present you make a record with its flags, and Quiver counts
+ * rendered (REAL, or REAL|NOFG) and generated (GENERATED) frames per second from them. They
+ * drive the HUD's base FPS ("79 -> 158") and FG multiplier while Quiver's own counting (the
+ * Sight layer's, from Reflex) has nothing, marked as your mod's. A frame metric that claims
+ * no roles is read by these flags; one claiming "frame.base"/"frame.generated" (with flag
+ * filters) by its claims. Without a ring, gauges claiming the roles "fps.base",
+ * "fps.generated" and "fg.ratio" do the same at 10 Hz. */
 enum {
     QUIVER_FRAME_REAL = 1u << 0,      /* rendered by the game */
     QUIVER_FRAME_GENERATED = 1u << 1, /* generated (interpolated/extrapolated) */
@@ -180,6 +192,8 @@ typedef struct quiver_frame {
 } quiver_frame;
 void quiver_frame_submit(quiver_mod *m, quiver_metric h, const quiver_frame *fr);
 void quiver_sample(quiver_mod *m, quiver_metric h, int64_t t_qpc, double value);
+/* 1 while the ring is mapped and Quiver reads it (it then wants your records); 0 before,
+ * without a ring, or under a Quiver older than 3.1. One load. */
 int quiver_perf_wanted(const quiver_mod *m);
 
 /* ---- Diagnostics ------------------------------------------------------------------- */
@@ -263,6 +277,16 @@ typedef struct qv_buf {
     int over;
 } qv_buf;
 
+/* The ring (quiver-perf's qv_ring_header / qv_record, little-endian x86). */
+#define QV_RING_MAGIC 0x474E495256515551ull /* "QUQVRING" */
+#define QV_RING_HDR 4096
+#define QV_RING_SLOT 128
+#define QV_RING_REQ (4096 + 4096 * 128) /* 4096 slots: ~13 s of 3 records a frame at 100 fps */
+#define QV_COMMIT_BUSY 0x8000000000000000ull
+#define QV_OFF_RESERVE 64
+#define QV_OFF_HEARTBEAT 128
+#define QV_OFF_DROPPED 136
+
 struct quiver_mod {
     int live; /* 0: the no-op handle */
     unsigned flags;
@@ -302,6 +326,14 @@ struct quiver_mod {
     LARGE_INTEGER last_m, last_decl, freq;
     DWORD backoff;
     volatile LONG st_connects, st_sent, st_received, st_dropped;
+    /* the ring (3.1): granted, asked for this connection, mapped (published last), its slot
+     * count, game threads inside a write, Quiver reads it (perf_ctl) */
+    int caps_rings, ring_asked;
+    char *volatile ring;
+    HANDLE ring_map;
+    uint32_t ring_slots;
+    volatile LONG ring_users, perf_wanted;
+    LARGE_INTEGER ring_beat;
 };
 
 static quiver_mod qv_noop_handle; /* zeroed: not live */
@@ -735,7 +767,7 @@ static void qv_hello(quiver_mod *m, qv_buf *b) {
     qv_put_str(b, QUIVER_MOD_VERSION, 32);
 #endif
     if (m->schema) { qv_puts(b, ",\"schema\":"); qv_put_str(b, m->schema, QV_MAX_FRAME / 2); }
-    qv_puts(b, ",\"caps\":[\"options\",\"metrics\",\"actions\",\"log\"]}");
+    qv_puts(b, ",\"caps\":[\"options\",\"metrics\",\"actions\",\"log\",\"rings\"]}");
 }
 
 /* Deliver a values object (`welcome`/`set`) to the callback; returns the ack's rejected
@@ -940,6 +972,126 @@ static void qv_dispatch(quiver_mod *m, const char *body, size_t n) {
     }
 }
 
+/* ---- the ring ---- */
+
+static uint64_t qv_ld64(const volatile char *p) { return (uint64_t)InterlockedCompareExchange64((volatile LONG64 *)p, 0, 0); }
+
+/* Map the ring Quiver made (`ring`): the file at path_win, checked like any file someone else
+ * wrote (magic, layout, size, a mod ring, Quiver's nonce), then published for game threads. */
+static void qv_ring_map(quiver_mod *m, const char *body, size_t n) {
+    char path[1024], nonce[40];
+    WCHAR wpath[1024];
+    HANDLE f, map;
+    LARGE_INTEGER size;
+    char *view;
+    uint32_t slots;
+    int i;
+    if (m->ring || !qv_member_str(body, n, "path_win", path, sizeof path)) return;
+    if (!MultiByteToWideChar(CP_UTF8, 0, path, -1, wpath, 1024)) return;
+    f = CreateFileW(wpath, GENERIC_READ | GENERIC_WRITE, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, NULL, OPEN_EXISTING, 0, NULL);
+    if (f == INVALID_HANDLE_VALUE) return;
+    if (!GetFileSizeEx(f, &size) || size.QuadPart < QV_RING_HDR || size.QuadPart > QV_RING_HDR + 8192 * QV_RING_SLOT) { CloseHandle(f); return; }
+    map = CreateFileMappingW(f, NULL, PAGE_READWRITE, 0, 0, NULL);
+    CloseHandle(f);
+    if (!map) return;
+    view = (char *)MapViewOfFile(map, FILE_MAP_WRITE, 0, 0, 0);
+    if (!view) { CloseHandle(map); return; }
+    slots = *(volatile uint32_t *)(view + 16);
+    if (qv_ld64(view) != QV_RING_MAGIC || *(volatile uint16_t *)(view + 8) != 1 || *(volatile uint16_t *)(view + 10) != QV_RING_HDR ||
+        *(volatile uint16_t *)(view + 12) != QV_RING_SLOT || *(volatile uint32_t *)(view + 20) != 2 || slots < 16 || slots > 8192 ||
+        (slots & (slots - 1)) != 0 || (LONGLONG)QV_RING_HDR + (LONGLONG)slots * QV_RING_SLOT > size.QuadPart)
+        goto bad;
+    if (qv_member_str(body, n, "nonce", nonce, sizeof nonce)) {
+        static const char hexd[] = "0123456789abcdef";
+        for (i = 0; i < 16; i++) {
+            unsigned char b = (unsigned char)view[32 + i];
+            if (nonce[2 * i] != hexd[b >> 4] || nonce[2 * i + 1] != hexd[b & 15]) goto bad;
+        }
+    }
+    m->ring_slots = slots;
+    m->ring_map = map;
+    InterlockedExchangePointer((PVOID volatile *)&m->ring, view); /* publish (full barrier) */
+    return;
+bad:
+    UnmapViewOfFile(view);
+    CloseHandle(map);
+}
+
+/* The connection ended: unpublish the ring, wait (briefly) for writers inside it, unmap. A
+ * writer that doesn't leave within a second keeps the view mapped (leaked, never unmapped
+ * under it). */
+static void qv_ring_unmap(quiver_mod *m) {
+    char *view = (char *)InterlockedExchangePointer((PVOID volatile *)&m->ring, NULL);
+    int i;
+    InterlockedExchange(&m->perf_wanted, 0);
+    if (!view) return;
+    for (i = 0; i < 1000 && m->ring_users; i++) Sleep(i < 10 ? 0 : 1);
+    if (m->ring_users) return;
+    UnmapViewOfFile(view);
+    CloseHandle(m->ring_map);
+    m->ring_map = 0;
+}
+
+/* Append one record (16 words; word 0, the commit, is ours). quiver-perf's protocol:
+ * reserve, claim the slot (CAS from an older lap to ours|BUSY, else drop), write, commit. */
+static void qv_ring_push(quiver_mod *m, const uint64_t *w) {
+    char *view;
+    volatile LONG64 *slot;
+    uint64_t i, want, c;
+    int k;
+    InterlockedIncrement(&m->ring_users);
+    view = (char *)InterlockedCompareExchangePointer((PVOID volatile *)&m->ring, NULL, NULL);
+    if (!view) {
+        InterlockedDecrement(&m->ring_users);
+        InterlockedIncrement(&m->st_dropped);
+        return;
+    }
+    i = (uint64_t)InterlockedExchangeAdd64((volatile LONG64 *)(view + QV_OFF_RESERVE), 1);
+    want = (i + 1) & ~QV_COMMIT_BUSY;
+    slot = (volatile LONG64 *)(view + QV_RING_HDR + (size_t)(i & (uint64_t)(m->ring_slots - 1)) * QV_RING_SLOT);
+    c = (uint64_t)InterlockedCompareExchange64(slot, 0, 0);
+    for (;;) {
+        uint64_t prev;
+        if ((c & QV_COMMIT_BUSY) != 0 || c >= want) {
+            InterlockedExchangeAdd64((volatile LONG64 *)(view + QV_OFF_DROPPED), 1);
+            InterlockedDecrement(&m->ring_users);
+            return;
+        }
+        prev = (uint64_t)InterlockedCompareExchange64(slot, (LONG64)(want | QV_COMMIT_BUSY), (LONG64)c);
+        if (prev == c) break;
+        c = prev;
+    }
+    for (k = 1; k < QV_RING_SLOT / 8; k++) slot[k] = (LONG64)w[k];
+    InterlockedExchange64(slot, (LONG64)want); /* commit, after the words (full barrier) */
+    InterlockedDecrement(&m->ring_users);
+}
+
+/* The SDK thread, while connected: ask for the ring once a ring metric was accepted, and
+ * keep its heartbeat (at least once a second). */
+static int qv_ring_tick(quiver_mod *m, qv_buf *b) {
+    int i, nslots = (int)m->nslots, want = 0;
+    LARGE_INTEGER now;
+    if (!m->caps_rings) return 1;
+    if (m->ring) {
+        QueryPerformanceCounter(&now);
+        if (now.QuadPart - m->ring_beat.QuadPart >= m->freq.QuadPart / 2) {
+            m->ring_beat = now;
+            InterlockedExchange64((volatile LONG64 *)(m->ring + QV_OFF_HEARTBEAT), now.QuadPart);
+        }
+        return 1;
+    }
+    if (m->ring_asked) return 1;
+    for (i = 0; i < nslots; i++)
+        if ((m->slots[i].kind == QUIVER_FRAME || m->slots[i].kind == QUIVER_SERIES) && m->slots[i].remote > 0) want = 1;
+    if (!want) return 1;
+    m->ring_asked = 1;
+    b->len = 0; b->over = 0;
+    qv_puts(b, "{\"t\":\"ring_req\",\"bytes\":");
+    qv_put_u64(b, QV_RING_REQ);
+    qv_puts(b, "}");
+    return qv_send(m, b);
+}
+
 /* A message arrived on the SDK thread. Returns 0 to disconnect. */
 static int qv_received(quiver_mod *m, const char *body, size_t n) {
     char t[16];
@@ -949,18 +1101,26 @@ static int qv_received(quiver_mod *m, const char *body, size_t n) {
         int64_t proto = 0;
         m->caps_metrics = qv_has_cap(body, n, "metrics");
         m->caps_options = qv_has_cap(body, n, "options");
+        m->caps_rings = m->caps_metrics && qv_has_cap(body, n, "rings");
         m->proto = qv_member_int(body, n, "proto", &proto) ? (int)proto : 0;
         InterlockedExchange(&m->connected, 1);
         m->backoff = 200;
     } else if (qv_streq(t, "metrics_ok")) {
         qv_metrics_ok(m, body, n);
         return 1;
+    } else if (qv_streq(t, "ring")) {
+        if (m->caps_rings) qv_ring_map(m, body, n);
+        return 1;
+    } else if (qv_streq(t, "perf_ctl")) {
+        char on[8];
+        if (qv_member_str(body, n, "rings", on, sizeof on)) InterlockedExchange(&m->perf_wanted, qv_streq(on, "on"));
+        return 1;
     } else if (qv_streq(t, "bye")) {
         /* Quiver refused us (or is going away): come back much later. */
         m->backoff = 30000;
         return 0;
     } else if (!qv_streq(t, "set") && !qv_streq(t, "action")) {
-        return 1; /* perf_ctl, ring, newer messages: not used by this SDK */
+        return 1; /* newer messages: not used by this SDK */
     }
     if (m->flags & QUIVER_POLL) {
         qv_queue(m, &m->inq, body, n);
@@ -1126,7 +1286,7 @@ static void qv_session(quiver_mod *m) {
     qv_buf b;
     if (!qv_buf_init(&b, 4096, QV_MAX_FRAME)) return;
     m->rx_len = 0;
-    m->caps_metrics = m->caps_options = 0;
+    m->caps_metrics = m->caps_options = m->caps_rings = m->ring_asked = 0;
     m->proto = 0;
     /* a stereo layout said before holds for the new connection too */
     if (m->stereo > 0) InterlockedExchange(&m->stereo_dirty, 1);
@@ -1180,6 +1340,7 @@ static void qv_session(quiver_mod *m) {
             }
         }
         if (!qv_flush(m, &b, 0)) goto out;
+        if (!qv_ring_tick(m, &b)) goto out;
     }
     /* stopping: send what's left and say bye (best effort) */
     qv_flush(m, &b, 1);
@@ -1188,6 +1349,8 @@ static void qv_session(quiver_mod *m) {
     qv_send(m, &b);
 out:
     InterlockedExchange(&m->connected, 0);
+    /* Quiver made the ring for this connection; the next one gets a new one. */
+    qv_ring_unmap(m);
     if (pending) {
         CancelIo(m->h);
         GetOverlappedResult(m->h, &rov, &got, TRUE);
@@ -1601,22 +1764,46 @@ int64_t quiver_now(void) {
     return c.QuadPart;
 }
 
+/* The record's metric index, or 0 (drop): the slot's kind and Quiver's 1-based index. */
+static LONG qv_ring_index(quiver_mod *m, quiver_metric h, int kind) {
+    qv_slot *s = qv_slot_of(m, h, kind);
+    LONG r = s ? s->remote : 0;
+    return r > 0 && r <= QV_MAX_METRICS ? r : 0;
+}
+
 void quiver_frame_submit(quiver_mod *m, quiver_metric h, const quiver_frame *fr) {
-    (void)h;
-    (void)fr;
-    if (QV_LIVE(m)) InterlockedIncrement(&m->st_dropped);
+    uint64_t w[QV_RING_SLOT / 8];
+    LONG idx;
+    int nf, k;
+    if (!QV_LIVE(m)) return;
+    idx = qv_ring_index(m, h, QUIVER_FRAME);
+    if (!idx || !fr || !m->ring) { InterlockedIncrement(&m->st_dropped); return; }
+    nf = fr->nfields < 0 ? 0 : fr->nfields > 12 ? 12 : fr->nfields;
+    w[0] = 0;
+    /* metric u16, flags u8 (REAL/GENERATED/NOFG only), nfields u8, swapchain u32 */
+    w[1] = (uint64_t)(uint16_t)idx | ((uint64_t)(fr->flags & 7u) << 16) | ((uint64_t)(unsigned)nf << 24) | ((uint64_t)fr->swapchain << 32);
+    w[2] = fr->key;
+    w[3] = (uint64_t)fr->t;
+    for (k = 0; k < 12; k++) w[4 + k] = k < nf ? (uint64_t)fr->f[k] : 0;
+    qv_ring_push(m, w);
 }
 
 void quiver_sample(quiver_mod *m, quiver_metric h, int64_t t_qpc, double value) {
-    (void)h;
-    (void)t_qpc;
-    (void)value;
-    if (QV_LIVE(m)) InterlockedIncrement(&m->st_dropped);
+    uint64_t w[QV_RING_SLOT / 8];
+    LONG idx;
+    int k;
+    if (!QV_LIVE(m)) return;
+    idx = qv_ring_index(m, h, QUIVER_SERIES);
+    if (!idx || !m->ring || !(value == value)) { InterlockedIncrement(&m->st_dropped); return; }
+    for (k = 0; k < 16; k++) w[k] = 0;
+    w[1] = (uint64_t)(uint16_t)idx | ((uint64_t)1 << 24); /* nfields 1 */
+    w[3] = (uint64_t)t_qpc;
+    qv_copy(&w[4], &value, sizeof value); /* f[0]: the double's bits */
+    qv_ring_push(m, w);
 }
 
 int quiver_perf_wanted(const quiver_mod *m) {
-    (void)m;
-    return 0;
+    return QV_LIVE(m) && m->ring && m->perf_wanted ? 1 : 0;
 }
 
 void quiver_get_stats(const quiver_mod *m, quiver_stats *out) {
