@@ -181,6 +181,29 @@ constexpr char kSigVideoUpdateAsync[] = "48 89 5c 24 10 57 48 83 ec 50 80 3d ?? 
 constexpr uintptr_t kRvaGfxGraphRecord = 0x4eb80;
 constexpr char kSigGfxGraphRecord[] = "48 8b c4 48 89 50 10 55 41 56 41 57 48 8d 68 a8 48 81 ec 40 01 00 00";
 constexpr size_t kGfxEngRenderToPass = 0x38;  // then +0x48, 0x10 bytes apart
+// The engine's +0x28 list holds every GfxGraph command of the update (GfxGraphEngineWrapper::addCommand
+// and addRenderToPassCommand). renderer+0x4ea30, called at the end of each world render's graph build
+// (renderer+0x1237c9, the build 0x11ee20), declares each into that graph (vtable +8, OrderSolver
+// 0x180910ba0), calls its clear (+0x18: resets the handles' last-writer links) and sets the count to 0;
+// then it starts the video streamers of GfxGraph textures referenced this frame.
+constexpr uintptr_t kRvaGfxGraphDeclare = 0x4ea30;
+constexpr char kSigGfxGraphDeclare[] = "48 89 54 24 10 57 48 83 ec 30 48 c7 44 24 20 fe ff ff ff 48 89 5c 24 40";
+constexpr size_t kGfxEngAll = 0x28;
+// int* to a counter: the object highlight bucket (renderer+0x1c2af0) takes only highlighted objects
+// whose +0xe0 stamp equals it (diagnostics: read at the GfxGraph pass per eye).
+constexpr uintptr_t kRvaVisCounterPtr = 0x802950;
+// The per-object render update (renderer+0x1c7c30, static): exchanges Object +0xe0 with the current
+// render counter (*renderer+0x802950, one tick per world render: live, left 1854 / right 1855) and, on a
+// change, refreshes the object's per-render data. Called by the mesh record, the highlight bucket and
+// the RT scene update (call at renderer+0xa8793, once per listed RT instance's object).
+constexpr uintptr_t kRvaObjRenderUpdate = 0x1c7c30;
+constexpr char kSigObjRenderUpdate[] = "48 89 5c 24 10 48 89 7c 24 18 55 48 8d 6c 24 a9 48 81 ec b0 00 00 00";
+constexpr uintptr_t kRvaObjUpdateRtCall = 0xa8793;
+// Highlighted objects (Object::enableObjectHighlight): r::Vector of {Object*, float4 colour} at
+// renderer+0x91dae8 (count +8). The bucket filler renderer+0x1c2af0 (from the pass 0x13e4e0) draws an
+// entry only if Object +0xe0 equals the render counter.
+constexpr uintptr_t kRvaHighlightList = 0x91dae8;
+constexpr uintptr_t kRvaHighlightFill = 0x1c2af0;
 
 // "rtd:Enable async build" (bool tweakable value, default 1; static: its constructor renderer+0x3b10):
 // with it the RT acceleration structures are built by a job on the async compute queue, fenced
