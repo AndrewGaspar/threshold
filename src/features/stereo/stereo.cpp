@@ -335,12 +335,129 @@ using VideoUpdate_t = void(__fastcall*)(void* self, float t, int where);
 VideoUpdate_t o_videoUpdate;
 std::atomic<uint64_t> g_n_video_skip{0};
 std::atomic<bool> g_video_once{true};  // stereo.video_once (dev): 0 = the right eye decodes too
+using VideoCount_t = int(__fastcall*)(const void* self);
+VideoCount_t g_videoCount;              // VideoStreamerFactory::countActiveSources (diagnostics)
+std::atomic<int> g_video_active{0};     // active sources at the last update
+std::atomic<uint32_t> g_video_where{0};  // VideoLocation values seen (bit per value)
 void __fastcall hk_videoUpdate(void* self, float t, int where) {
+  if (g_videoCount) g_video_active = g_videoCount(self);
+  g_video_where |= 1u << (where & 31);
   if (g_video_once.load(std::memory_order_relaxed) && g_vis_phase.load(std::memory_order_relaxed) == 2 && GetCurrentThreadId() == g_vis_tid.load()) {
     g_n_video_skip++;
     return;
   }
   o_videoUpdate(self, t, where);
+}
+
+// GfxGraph effects (engine.h kRvaGfxGraphRecord): the game's node-graph VFX (Polaris, the Hiss'
+// damage / cloak / shield effects) reach the renderer as two lists the render thread fills once per
+// update from RendererThreading messages, and each world render's GfxGraphEngine pass records them
+// into its draw buckets and then empties them. The right eye found them empty: those effects were
+// drawn in the left eye only. The left eye's lists are kept and put back for the right eye.
+using GfxRecord_t = void(__fastcall*)(void* eng, void* a2, void* a3, void* a4);
+GfxRecord_t o_gfxRecord;
+std::atomic<bool> g_gfx_replay{true};  // stereo.gfxgraph_replay (dev, live): 0 = main's behaviour
+std::vector<void*> g_gfx_saved[2];     // +0x38 render-to-pass commands, +0x48 particle-system commands
+std::atomic<uint64_t> g_n_gfx_calls[3], g_n_gfx_cmds[3], g_n_gfx_ps[3], g_n_gfx_replays{0}, g_n_gfx_cap{0};
+struct GfxList {  // r::Vector: {T* data, u32 count, u32 capacity | flags}
+  void** data;
+  uint32_t count, cap;
+};
+void __fastcall hk_gfxRecord(void* eng, void* a2, void* a3, void* a4) {
+  int ph = g_vis_phase.load(std::memory_order_relaxed);
+  if (ph < 0 || ph > 2) ph = 0;
+  auto* lists = reinterpret_cast<GfxList*>(static_cast<uint8_t*>(eng) + kGfxEngRenderToPass);  // +0x38, +0x48
+  if (ph == 2 && g_gfx_replay.load(std::memory_order_relaxed) && lists[0].count == 0 && lists[1].count == 0) {
+    bool put = false;
+    for (int i = 0; i < 2; i++) {
+      auto& s = g_gfx_saved[i];
+      if (s.empty()) continue;
+      if ((lists[i].cap & 0x3fffffffu) < s.size() || !lists[i].data) {
+        g_n_gfx_cap++;
+        continue;
+      }
+      memcpy(lists[i].data, s.data(), s.size() * sizeof(void*));
+      lists[i].count = uint32_t(s.size());
+      put = true;
+    }
+    if (put) g_n_gfx_replays++;
+  }
+  g_n_gfx_calls[ph]++;
+  g_n_gfx_cmds[ph] += lists[0].count;
+  g_n_gfx_ps[ph] += lists[1].count;
+  for (int i = 0; i < 2; i++) {
+    if (ph == 1)
+      g_gfx_saved[i].assign(lists[i].data, lists[i].data + lists[i].count);
+    else
+      g_gfx_saved[i].clear();
+  }
+  o_gfxRecord(eng, a2, a3, a4);
+}
+
+// The other half of the GfxGraph frame (engine.h kRvaGfxGraphDeclare): every GfxGraph command of the
+// update (+0x28: resource alloc/free, clears, render-to-texture, compute, swaps, render-to-pass) is
+// declared into the world render's graph at the end of its build, then the list is emptied. The right
+// eye's graph got none of the offscreen work, so effects composed from a GfxGraph render texture
+// (the Launch target outline, live) had nothing to sample there. The left eye's list is declared
+// again into the right eye's graph.
+using GfxDeclare_t = void(__fastcall*)(void* eng, void* a2, void* a3, void* a4);
+GfxDeclare_t o_gfxDeclare;
+std::atomic<int> g_gfx_declare{1};  // stereo.gfxgraph_declare (dev, live): 0 off, 1 all, 2 without swaps/compute
+std::vector<void*> g_gfx_decl_saved;
+std::atomic<uint64_t> g_n_gfx_decl[3], g_n_gfx_decl_replays{0}, g_n_gfx_decl_dropped{0};
+// command kinds by vtable RVA (static): counted in the left eye's list for `stereo status`
+constexpr uintptr_t kGfxVt[] = {0x6231d0, 0x6231f8, 0x623248, 0x623220, 0x6231a8, 0x623180,
+                                0x623158, 0x623130, 0x6230d8, 0x623108};
+constexpr const char* kGfxVtName[] = {"rtt", "rtp", "alloc", "free", "clear_rt", "clear_db",
+                                      "swap_rt", "swap_db", "compute", "debug"};
+constexpr int kGfxKinds = sizeof(kGfxVt) / sizeof(kGfxVt[0]);
+std::atomic<uint64_t> g_n_gfx_kind[kGfxKinds + 1];
+int gfx_kind(void* cmd) {
+  uintptr_t vt = *reinterpret_cast<uintptr_t*>(cmd) - g_rimg.base;
+  for (int i = 0; i < kGfxKinds; i++)
+    if (vt == kGfxVt[i]) return i;
+  return kGfxKinds;
+}
+void __fastcall hk_gfxDeclare(void* eng, void* a2, void* a3, void* a4) {
+  int ph = g_vis_phase.load(std::memory_order_relaxed);
+  if (ph < 0 || ph > 2) ph = 0;
+  auto* list = reinterpret_cast<GfxList*>(static_cast<uint8_t*>(eng) + kGfxEngAll);
+  int mode = g_gfx_declare.load(std::memory_order_relaxed);
+  if (ph == 2 && mode && list->count == 0 && !g_gfx_decl_saved.empty()) {
+    uint32_t n = 0;
+    if ((list->cap & 0x3fffffffu) >= g_gfx_decl_saved.size() && list->data) {
+      for (void* c : g_gfx_decl_saved) {
+        int k = gfx_kind(c);
+        if (mode == 2 && (k == 6 || k == 7 || k == 8)) {
+          g_n_gfx_decl_dropped++;
+          continue;
+        }
+        list->data[n++] = c;
+      }
+      list->count = n;
+      g_n_gfx_decl_replays++;
+    } else {
+      g_n_gfx_cap++;
+    }
+  }
+  g_n_gfx_decl[ph] += list->count;
+  if (ph == 1) {
+    g_gfx_decl_saved.assign(list->data, list->data + list->count);
+    for (void* c : g_gfx_decl_saved) g_n_gfx_kind[gfx_kind(c)]++;
+  } else {
+    g_gfx_decl_saved.clear();
+  }
+  o_gfxDeclare(eng, a2, a3, a4);
+}
+std::string gfx_kinds_json() {
+  std::string j = "{";
+  for (int i = 0; i <= kGfxKinds; i++) {
+    char b[64];
+    snprintf(b, sizeof b, "%s\"%s\":%llu", i ? "," : "", i < kGfxKinds ? kGfxVtName[i] : "other",
+             (unsigned long long)g_n_gfx_kind[i].load());
+    j += b;
+  }
+  return j + "}";
 }
 
 // ---- fence trace (dev, stereo.fence_trace = 1 at start-up) ----------------------------------------
@@ -1191,7 +1308,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s,\"pause_sbs\":%llu,\"ui\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"video\":{\"active\":%d,\"where\":%u},\"gfx\":{\"replay\":%d,\"calls\":[%llu,%llu,%llu],\"cmds\":[%llu,%llu,%llu],\"ps\":[%llu,%llu,%llu],\"replays\":%llu,\"cap_short\":%llu,\"declare\":%d,\"decl\":[%llu,%llu,%llu],\"decl_replays\":%llu,\"decl_dropped\":%llu,\"kinds\":%s},\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s,\"pause_sbs\":%llu,\"ui\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1199,7 +1316,7 @@ std::string status_json() {
            (unsigned long long)g_n_hud2.load(), (unsigned long long)gpu_dup_count(), (unsigned long long)g_n_dup.load(), (unsigned long long)g_n_mono_dup.load(),
            (unsigned long long)g_n_mono_fallback.load(), (unsigned long long)g_n_rand_rec.load(),
            (unsigned long long)g_n_rand_replay.load(), (unsigned long long)g_n_vis_reuse.load(),
-           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_rt_upd_skipped.load(), (unsigned long long)g_n_tlas_skipped.load(), (unsigned long long)g_n_left_builds.load(), (unsigned long long)g_n_left_compactions.load(), (unsigned long long)g_n_hud_wide.load(),
+           (unsigned long long)g_n_vis_held.load(), (unsigned long long)g_n_vis_miss.load(), (unsigned long long)g_n_video_skip.load(), g_video_active.load(), g_video_where.load(), int(g_gfx_replay.load()), (unsigned long long)g_n_gfx_calls[0].load(), (unsigned long long)g_n_gfx_calls[1].load(), (unsigned long long)g_n_gfx_calls[2].load(), (unsigned long long)g_n_gfx_cmds[0].load(), (unsigned long long)g_n_gfx_cmds[1].load(), (unsigned long long)g_n_gfx_cmds[2].load(), (unsigned long long)g_n_gfx_ps[0].load(), (unsigned long long)g_n_gfx_ps[1].load(), (unsigned long long)g_n_gfx_ps[2].load(), (unsigned long long)g_n_gfx_replays.load(), (unsigned long long)g_n_gfx_cap.load(), g_gfx_declare.load(), (unsigned long long)g_n_gfx_decl[0].load(), (unsigned long long)g_n_gfx_decl[1].load(), (unsigned long long)g_n_gfx_decl[2].load(), (unsigned long long)g_n_gfx_decl_replays.load(), (unsigned long long)g_n_gfx_decl_dropped.load(), gfx_kinds_json().c_str(), (unsigned long long)g_n_level_changes.load(), (unsigned long long)g_n_load_mono.load(), (unsigned long long)g_n_blas_builds.load(), (unsigned long long)g_n_as_skipped.load(), (unsigned long long)g_n_refit_skipped.load(), (unsigned long long)g_n_as_late.load(), (unsigned long long)g_n_as_extra.load(), (unsigned long long)g_n_as_new.load(), (unsigned long long)g_n_as_new_built.load(), (unsigned long long)g_n_rt_upd_skipped.load(), (unsigned long long)g_n_tlas_skipped.load(), (unsigned long long)g_n_left_builds.load(), (unsigned long long)g_n_left_compactions.load(), (unsigned long long)g_n_hud_wide.load(),
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str(), (unsigned long long)g_n_pause_sbs.load(),
@@ -1353,6 +1470,10 @@ void stereo_register() {
       g_as_once = (v == "false" || v == "off") ? 0 : (v == "true" || v == "on" || v.empty()) ? 21 : atoi(v.c_str());
     } else if (id == "stereo.video_once") {
       g_video_once = !(v == "0" || v == "false" || v == "off");
+    } else if (id == "stereo.gfxgraph_declare") {
+      g_gfx_declare = v.empty() ? 1 : atoi(v.c_str());
+    } else if (id == "stereo.gfxgraph_replay") {
+      g_gfx_replay = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.load_mono") {
       g_load_mono = !(v == "0" || v == "false" || v == "off");
     } else if (id == "stereo.rt_async_build") {
@@ -1490,10 +1611,23 @@ void stereo_start() {
       !hook_fn((void*)g_rt_alloc, (void*)hk_rt_alloc, (void**)&o_rt_alloc, "RenderTargetManager::allocTexture2D"))
     o_rt_alloc = nullptr;  // only hooked when the dev option asks for it (start-up)
   if (void* vu = module_export(kRenderer, kExpVideoUpdateAsync, "stereo"); vu && sig_match(vu, kSigVideoUpdateAsync)) {
+    g_videoCount = reinterpret_cast<VideoCount_t>(module_export(kRenderer, "?countActiveSources@VideoStreamerFactory@rend@@QEBAHXZ", "stereo"));
     if (!hook_fn(vu, (void*)hk_videoUpdate, (void**)&o_videoUpdate, "VideoStreamerFactory::updateAsync"))
       TH_LOG("stereo: video decode not hooked; world video textures decode twice per update in sbs");
   } else {
     TH_LOG("stereo: VideoStreamerFactory::updateAsync missing or signature mismatch; video textures decode twice per update in sbs");
+  }
+  if (void* gd = reinterpret_cast<void*>(g_rimg.at(kRvaGfxGraphDeclare)); sig_match(gd, kSigGfxGraphDeclare)) {
+    if (!hook_fn(gd, (void*)hk_gfxDeclare, (void**)&o_gfxDeclare, "GfxGraphEngine declare (stereo: GfxGraph offscreen work in both eyes)"))
+      TH_LOG("stereo: GfxGraphEngine declare not hooked; GfxGraph offscreen work only in the left eye");
+  } else {
+    TH_LOG("stereo: GfxGraphEngine declare signature mismatch; GfxGraph offscreen work only in the left eye");
+  }
+  if (void* gg = reinterpret_cast<void*>(g_rimg.at(kRvaGfxGraphRecord)); sig_match(gg, kSigGfxGraphRecord)) {
+    if (!hook_fn(gg, (void*)hk_gfxRecord, (void**)&o_gfxRecord, "GfxGraphEngine pass (stereo: GfxGraph effects in both eyes)"))
+      TH_LOG("stereo: GfxGraphEngine pass not hooked; GfxGraph effects (Polaris, Hiss) only in the left eye");
+  } else {
+    TH_LOG("stereo: GfxGraphEngine pass signature mismatch; GfxGraph effects (Polaris, Hiss) only in the left eye");
   }
   if (HMODULE crt = GetModuleHandleW(L"ucrtbase.dll")) {
     void* r = (void*)GetProcAddress(crt, "rand");
