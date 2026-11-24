@@ -75,7 +75,7 @@ Capture_t o_capture;
 HudProject_t o_hud_project;
 UiEngine g_eng;
 Image g_ren;
-std::atomic<bool> g_markers_on{true}, g_pause_on{true};
+std::atomic<bool> g_markers_on{true}, g_pause_on{true}, g_reticle_on{true};
 
 // --- per-draw UI state (renderer thread) -----------------------------------------------------------
 thread_local float t_xf[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
@@ -132,6 +132,36 @@ bool __fastcall hk_hud_project(const float* dir, const float* pos, float* out, c
   return r;
 }
 
+// The enemy health bars and nameplates (UIHudEnemyStatus, "m_vecHealthBarPos": exe+0x5fe3c0, static)
+// project with coregame::CameraComponentState::worldToScreen, whose result is normalized (0..1, the
+// caller tests that range and scales by the UI size). The Vector2-returning overload (coregame+0xbcd50,
+// hidden return pointer) calls the bool one (coregame+0xbcd80, static), so hooking the bool one sees
+// both; recorded like the HUD projection above.
+constexpr char kExpW2SBool[] =
+    "?worldToScreen@CameraComponentState@coregame@@QEAA_NAEBV?$Vector3Template@M@m@@AEAV?$Vector2Template@M@4@@Z";
+constexpr char kSigW2SBool[] = "48 8b c4 55 48 8d a8 38 fd ff ff 48 81 ec c0 03 00 00 48 c7 44 24 60 fe";
+using W2SBool_t = bool(__fastcall*)(void* cam, const float* v, float* out);
+W2SBool_t o_w2s_bool;
+int g_ui_w = 0, g_ui_h = 0;  // the eye's output size (the UI's), from the renderer thread
+std::atomic<uint64_t> g_n_w2s{0};
+bool __fastcall hk_w2s_bool(void* cam, const float* v, float* out) {
+  bool r = o_w2s_bool(cam, v, out);
+  g_n_w2s++;
+  // Off-screen results are not drawn (the health bar caller tests 0..1): only on-screen points.
+  if (r && out && v && out[0] > 0 && out[0] < 1 && out[1] > 0 && out[1] < 1 &&
+      g_markers_on.load(std::memory_order_relaxed) && g_ui_w > 0) {
+    Proj p;
+    memcpy(p.P, v, sizeof p.P);
+    p.sx = out[0] * g_ui_w, p.sy = out[1] * g_ui_h;
+    p.clamped = false;
+    p.frame = present_frame();
+    std::lock_guard lk(g_pmu);
+    g_proj[g_proj_pos] = p;
+    g_proj_pos = (g_proj_pos + 1) % kProjRing;
+  }
+  return r;
+}
+
 // --- markers of this frame (renderer thread) ---------------------------------------------------
 struct Marker {
   float P[3];
@@ -147,6 +177,7 @@ UiFrame g_f;
 bool g_f_ok = false;
 struct ProbeMeta {
   int n = 0;
+  int ret_first = 0, ret_n = 0;  // the reticle's samples
   float P[kProbeSlots][3];
 };
 ProbeMeta g_pm[kProbeRing];
@@ -158,6 +189,10 @@ std::string g_last_mk;  // status: the markers of the last HUD pass
 std::mutex g_smu;
 
 double dot3(const double* a, const double* b) { return a[0] * b[0] + a[1] * b[1] + a[2] * b[2]; }
+float dist2(const float* a, const float* b) {
+  float x = a[0] - b[0], y = a[1] - b[1], z = a[2] - b[2];
+  return x * x + y * y + z * z;
+}
 
 // The disparity (px) of a point at depth z in eye e relative to the centre image, plus convergence:
 // what the scene at that depth gets, so the marker sits at depth z.
@@ -168,9 +203,68 @@ float eye_shift(int e, double z) {
   return float(e == 0 ? d + (g_f.proj_conv ? 0 : g_f.shift[0]) : -d + (g_f.proj_conv ? 0 : g_f.shift[1]));
 }
 
+// --- the reticle (the crosshair at the screen centre: the aim ray) -------------------------------
+// Control's crosshair (UIHudCrosshair, its model has no position: static) sits at the screen centre,
+// so the aim ray is the centre camera's ray through the centre (live: the crosshair's layers are
+// composited centred on (W/2, H/2) within a few px). Like Pharos's bow and Senu reticles it is drawn
+// at the depth where that ray first meets the scene: kReticleSamples texels of the left eye's linear
+// depth, where ray points at log-spaced depths appear in that eye, read back with the marker probes;
+// the nearest sample whose surface is at or in front of its ray point is the hit. Newly nearer hits
+// apply at once; farther ones ease in (1/z, a quarter per frame), so a briefly passing occluder does
+// not make the reticle jump back and forth.
+constexpr int kMarkerSlots = 32, kReticleSamples = kProbeSlots - kMarkerSlots;
+constexpr float kReticleNear = 0.4f, kReticleFar = 400.0f;
+struct Reticle {
+  float inv = 0;        // 1/z shown (0: none yet)
+  float z_hit = 0;      // the last measured hit (m)
+  float s[2] = {0, 0};  // per-eye shift (px)
+  bool valid = false;
+} g_ret;
+std::atomic<uint64_t> g_n_reticle_draws{0};
+float reticle_sample_z(int k) {
+  return kReticleNear * std::pow(kReticleFar / kReticleNear, float(k) / float(kReticleSamples - 1));
+}
+// The left eye's x offset (output px, from the centre column) of the centre ray's point at depth z.
+double left_offset(double z) {
+  double K = g_f.sep_m * g_f.m00 * g_f.w / 2.0;
+  return g_f.sign * K / z - (g_f.proj_conv && g_f.conv_m > 0 ? g_f.sign * K / g_f.conv_m : 0);
+}
+float eye_shift(int e, double z);
+void update_reticle(int ring, int first, int n) {
+  g_ret.valid = false;
+  if (!g_reticle_on.load() || n < kReticleSamples) return;
+  // f = 1/surface - 1/ray: >= 0 where the surface is at or in front of the ray point. The hit is
+  // where f crosses zero between two samples (1/z interpolated); the samples are 25 % apart in z.
+  float hit = 0, prev_f = 0, prev_inv = 0;
+  bool have_prev = false;
+  for (int k = 0; k < kReticleSamples; k++) {  // near to far along the ray
+    float v = 0;
+    if (!gpu_probe_value(ring, first + k, &v) || !(v > 0) || !std::isfinite(v)) continue;
+    float f = 1.0f / v - 1.0f / reticle_sample_z(k);
+    if (f >= 0) {
+      float inv = 1.0f / v;
+      if (have_prev && prev_f < 0) inv = prev_inv + (inv - prev_inv) * (-prev_f / (f - prev_f));
+      hit = 1.0f / inv;
+      break;
+    }
+    prev_f = f, prev_inv = 1.0f / v, have_prev = true;
+  }
+  if (!(hit > 0)) hit = kReticleFar;
+  g_ret.z_hit = hit;
+  float t = 1.0f / std::max(hit, kReticleNear);
+  g_ret.inv = (g_ret.inv <= 0 || t > g_ret.inv) ? t : g_ret.inv + (t - g_ret.inv) * 0.25f;
+  for (int e = 0; e < 2; e++) g_ret.s[e] = eye_shift(e, 1.0 / g_ret.inv);
+  g_ret.valid = true;
+}
+
 void build_markers() {
   g_mk.clear();
-  if (!g_f_ok || !g_markers_on.load()) return;
+  if (!g_f_ok) return;
+  if (!g_markers_on.load()) {
+    int rr = int((g_hud_n + 1) % kProbeRing);
+    update_reticle(rr, g_pm[rr].ret_first, g_pm[rr].ret_n);
+    return;
+  }
   uint64_t now = present_frame();
   {
     std::lock_guard lk(g_pmu);
@@ -179,7 +273,7 @@ void build_markers() {
       if (!p.frame || p.frame + 3 < now) continue;
       bool dup = false;
       for (auto& m : g_mk)
-        if (!memcmp(m.P, p.P, sizeof p.P)) {
+        if (dist2(m.P, p.P) < 0.25f) {  // the same anchor (a moving enemy: a few cm per frame)
           dup = true;
           break;
         }
@@ -191,16 +285,17 @@ void build_markers() {
       double d[3] = {p.P[0] - g_f.cam_pos[0], p.P[1] - g_f.cam_pos[1], p.P[2] - g_f.cam_pos[2]};
       m.z_anchor = float(dot3(d, g_f.cam_fwd));
       g_mk.push_back(m);
-      if (g_mk.size() >= size_t(kProbeSlots)) break;
+      if (g_mk.size() >= size_t(kMarkerSlots)) break;
     }
   }
   // Surface depths probed kProbeRing - 1 passes ago (the oldest ring entry), matched by anchor.
   int rr = int((g_hud_n + 1) % kProbeRing);
+  update_reticle(rr, g_pm[rr].ret_first, g_pm[rr].ret_n);
   for (int i = 0; i < g_pm[rr].n; i++) {
     float v = 0;
     if (!gpu_probe_value(rr, i, &v) || !(v > 0) || !std::isfinite(v)) continue;
     for (auto& m : g_mk)
-      if (!memcmp(m.P, g_pm[rr].P[i], sizeof m.P)) m.z_surface = v;
+      if (dist2(m.P, g_pm[rr].P[i]) < 0.5625f) m.z_surface = v;  // within 0.75 m: the same anchor
   }
   for (auto& m : g_mk) {
     float z = m.clamped ? m.z_surface : m.z_anchor;
@@ -240,7 +335,7 @@ void probe_markers(ID3D12GraphicsCommandList* cl) {
   if (!depth || g_f.w <= 0) return;
   int rw = nt_w(depth), rh = nt_h(depth);
   for (auto& m : g_mk) {
-    if (pm.n >= kProbeSlots) break;
+    if (pm.n >= kMarkerSlots) break;
     double x = m.x, y = m.y;
     if (!m.clamped && m.z_anchor > 0.3f) {  // the anchor's position in the left eye's own render
       double K = g_f.sep_m * g_f.m00 * g_f.w / 2.0;
@@ -252,6 +347,15 @@ void probe_markers(ID3D12GraphicsCommandList* cl) {
       pm.n++;
       g_n_probes++;
     }
+  }
+  pm.ret_first = kMarkerSlots;
+  pm.ret_n = 0;
+  if (!g_reticle_on.load()) return;
+  for (int k = 0; k < kReticleSamples; k++) {
+    double x = g_f.w / 2.0 + left_offset(reticle_sample_z(k));
+    int px = int(x * rw / g_f.w), py = rh / 2;
+    if (gpu_probe(cl, depth, g_pass_ring, kMarkerSlots + k, px, py)) pm.ret_n++;
+    else break;
   }
 }
 
@@ -340,20 +444,41 @@ void on_draw(ID3D12GraphicsCommandList* cl, int phase, DupDraw& d) {
     return;
   }
   if (phase == 0) {
-    if (!g_probed && !g_mk.empty()) probe_markers(cl);
+    if (!g_probed && (!g_mk.empty() || g_reticle_on.load())) probe_markers(cl);
     bool dump = g_dump_huds.load(std::memory_order_relaxed) > 0;
     const Marker* hit = nullptr;
     // A Coherent layer composited into the side-by-side target (2W): a small texture drawn with its
     // element's screen position in the Transform's translation (live: x = T[3] * viewport width,
     // y = T[7] * viewport height, within a few px of the projected anchor).
-    if (t_in_exec && nt_w(t_rt) == 2 * g_hud_w && !g_mk.empty()) {
+    // The reticle: a layer composited centred near the screen centre (its quad: the texture's size
+    // times the Transform's scale, at its translation; live, the crosshair's 384x384 and 256x128
+    // layers at half scale, centred within 12 px of (W/2, H/2) and 72 px below it).
+    bool reticle = false;
+    if (t_in_exec && g_ret.valid && nt_w(t_rt) == 2 * g_hud_w && t_tex[0] && nt_w(t_tex[0]) <= 512 &&
+        nt_h(t_tex[0]) <= 512) {
+      float qw = nt_w(t_tex[0]) * t_xf[0] * d.vp_w, qh = nt_h(t_tex[0]) * t_xf[5] * d.vp_h;
+      float cx = t_xf[3] * d.vp_w + qw / 2, cy = t_xf[7] * d.vp_h + qh / 2;
+      // Tight horizontally: an enemy health bar a little off the centre is not the crosshair (live,
+      // a 128x128 bar layer 65 px left of the centre had been taken for it).
+      if (qw > 0 && qh > 0 && qw <= 400 && qh <= 400 && std::fabs(cx - g_hud_w / 2.0f) <= 32 &&
+          std::fabs(cy - g_hud_h / 2.0f) <= 120) {
+        reticle = true;
+        d.shift[0] = g_ret.s[0];
+        d.shift[1] = g_ret.s[1];
+        g_n_reticle_draws++;
+      }
+    }
+    if (!reticle && t_in_exec && nt_w(t_rt) == 2 * g_hud_w && !g_mk.empty()) {
       void* tx = t_tex[0];
       if (tx && nt_w(tx) <= 256 && nt_h(tx) <= 256) {
-        float x = t_xf[3] * d.vp_w, y = t_xf[7] * d.vp_h;
+        // The quad's centre (texture size times the Transform's scale, at its translation): live, an
+        // interaction icon centred ~30 px right of and ~45 px below its anchor, an enemy health bar
+        // layer (128x128) ~25 px right of and ~35 px above its worldToScreen point.
+        float x = t_xf[3] * d.vp_w + nt_w(tx) * t_xf[0] * d.vp_w / 2, y = t_xf[7] * d.vp_h + nt_h(tx) * t_xf[5] * d.vp_h / 2;
         float best = 1e9f;
         for (auto& m : g_mk) {
           float dx = x - m.x, dy = y - m.y;
-          if (std::fabs(dx) > 56 || std::fabs(dy) > 80) continue;
+          if (std::fabs(dx) > 64 || std::fabs(dy) > 80) continue;
           float dd = dx * dx + dy * dy;
           if (dd < best) best = dd, hit = &m;
         }
@@ -368,7 +493,7 @@ void on_draw(ID3D12GraphicsCommandList* cl, int phase, DupDraw& d) {
       const float* m = t_xf;
       TH_LOG("ui draw %d: n=%u vp=(%.0f,%.0f %.0fx%.0f) T=[%.4g %.4g %.4g %.4g | %.4g %.4g %.4g %.4g] tex=%s rt=%s exec=%d -> %s %.2f/%.2f",
              g_dump_draw, d.count, d.vp_x, d.vp_y, d.vp_w, d.vp_h, m[0], m[1], m[2], m[3], m[4], m[5], m[6], m[7],
-             tex_desc(t_tex[0]).c_str(), tex_desc(t_rt).c_str(), t_in_exec, hit ? "marker" : "-", d.shift[0], d.shift[1]);
+             tex_desc(t_tex[0]).c_str(), tex_desc(t_rt).c_str(), t_in_exec, reticle ? "reticle" : hit ? "marker" : "-", d.shift[0], d.shift[1]);
     }
     g_dump_draw++;
     return;
@@ -395,6 +520,10 @@ bool ui_start(const Image& renderer, const UiEngine& eng) {
   }
   if (Image exe = game_image(); ok && exe && sig_match((void*)exe.at(kRvaHudProject), kSigHudProject)) {
     hook_fn((void*)exe.at(kRvaHudProject), (void*)hk_hud_project, (void**)&o_hud_project, "HUD world-to-screen");
+    if (void* f = module_export(L"coregame_rmdwin10_f.dll", kExpW2SBool, "stereo ui"); f && sig_match(f, kSigW2SBool))
+      hook_fn(f, (void*)hk_w2s_bool, (void**)&o_w2s_bool, "CameraComponentState::worldToScreen");
+    else
+      TH_LOG("stereo ui: CameraComponentState::worldToScreen missing or signature mismatch: health bars at screen depth");
   } else {
     TH_LOG("stereo ui: UI backend or HUD projection (exe+0x5edb50) signature mismatch: markers stay at screen depth");
     g_markers_on = false;
@@ -414,11 +543,13 @@ bool ui_start(const Image& renderer, const UiEngine& eng) {
 void ui_option(const std::string& id, const std::string& v) {
   bool on = !(v == "0" || v == "false" || v == "off");
   if (id == "stereo.ui_markers") g_markers_on = on;
+  else if (id == "stereo.ui_reticle") g_reticle_on = on;
   else if (id == "stereo.ui_pause") g_pause_on = on;
 }
 
 void ui_frame(const UiFrame& f) {
   g_f = f;
+  g_ui_w = f.w, g_ui_h = f.h;
   g_f_ok = f.w > 0 && f.m00 > 0;
 }
 
@@ -476,7 +607,7 @@ void ui_hud_begin(bool sbs, int w) {
   g_hud_obs = !sbs && g_dump_huds.load() > 0;
   if (g_hud_obs) gpu_draw_observe(true);
   if (g_hud_sbs && !g_hud_pause && o_hud_project) build_markers();
-  else g_mk.clear();
+  else g_mk.clear(), g_ret.valid = false;
   if (g_dump_huds.load() > 0) {
     TH_LOG("ui hud begin frame %llu sbs %d pause %d w %d markers %zu capture %p", (unsigned long long)present_frame(),
            int(sbs), int(g_hud_pause), w, g_mk.size(), g_pause.tex);
@@ -522,14 +653,16 @@ std::string ui_status() {
     std::lock_guard lk(g_smu);
     mk = g_last_mk.empty() ? "[]" : g_last_mk;
   }
-  char b[512];
+  char b[768];
   snprintf(b, sizeof b,
-           "{\"markers_on\":%s,\"pause_on\":%s,\"projections\":%llu,\"markers\":%llu,\"moved_draws\":%llu,\"probes\":%llu,"
-           "\"occluded\":%llu,\"pause_captures\":%llu,\"pause_active\":%s,\"bg_skips\":%llu,\"pause_ends\":%llu,\"last\":",
+           "{\"markers_on\":%s,\"pause_on\":%s,\"projections\":%llu,\"markers\":%llu,\"moved_draws\":%llu,\"probes\":%llu,\"w2s\":%llu,"
+           "\"occluded\":%llu,\"reticle\":{\"on\":%s,\"z_hit\":%.2f,\"z\":%.2f,\"shift\":[%.2f,%.2f],\"draws\":%llu},\"pause_captures\":%llu,\"pause_active\":%s,\"bg_skips\":%llu,\"pause_ends\":%llu,\"last\":",
            g_markers_on.load() ? "true" : "false", g_pause_on.load() ? "true" : "false",
            (unsigned long long)g_n_proj.load(), (unsigned long long)g_n_markers.load(),
-           (unsigned long long)g_n_moved.load(), (unsigned long long)g_n_probes.load(),
-           (unsigned long long)g_n_occluded.load(), (unsigned long long)g_n_capture.load(),
+           (unsigned long long)g_n_moved.load(), (unsigned long long)g_n_probes.load(), (unsigned long long)g_n_w2s.load(),
+           (unsigned long long)g_n_occluded.load(), g_reticle_on.load() ? "true" : "false", g_ret.z_hit,
+           g_ret.inv > 0 ? 1.0f / g_ret.inv : 0.0f, g_ret.s[0], g_ret.s[1], (unsigned long long)g_n_reticle_draws.load(),
+           (unsigned long long)g_n_capture.load(),
            g_pause.active ? "true" : "false", (unsigned long long)g_n_bg_skips.load(),
            (unsigned long long)g_n_pause_end.load());
   return b + mk + "}";
