@@ -1075,6 +1075,21 @@ waits never satisfied as `STUCK`.
   surface probe is 3 HUD passes old (a fast turn can use a stale surface for a few frames).
   HypXRland not tested (the user's display).
 
+### Resume notes: the pause freeze fix (2026-11-23, branch `wip/stereo-ui-pause-fix`, paused mid-verification)
+
+- **State.** Reworked pause path committed (3b0d788 and this note). Verified on rayblaster: Esc pause in
+  `full` (control-ui, 3840x1080) and `hsbs` (control-ui1080: 1920x1080, DLSS Balanced): background
+  per eye, menu at 0 px; photo mode, a checkpoint restart while paused, quit to menu: presents keep
+  advancing, the pause background ends (world render / load), no Xid. The memo/document reader was
+  never reproduced (no reader opens at the `game-start` story point), so the laptop freeze's exact
+  cause is not established. A control run of main's build through the same flows (hsbs) was in
+  progress when the session stopped.
+- **Next.** Read that control run's result (if main also passes, the trigger is reader-specific);
+  find a document that opens the reader (a later story point, or a tutorial popup) and test both
+  builds there; then merge to main, install to the laptop mod only while the game is not running.
+- Queued after it: the reticle at the aim ray's depth, enemy health bars/nameplates at the enemy's
+  depth (coordinator's request).
+
 ## Reproducing
 
 ```sh
