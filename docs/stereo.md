@@ -51,6 +51,7 @@ left, right eye right, the HUD hint in both halves.*
 | Ordinary play with RT on in sbs (the in-world GPU fault) | fixed (`as_once = 5`) | live, rayblaster r41/r42 (14 and 10 min in the world, every earlier 3D run faulted within ~3 min) |
 | World-anchored HUD markers (interaction / collectible prompts, mission markers) at the depth of what they mark, or just in front of the surface hiding it (`ui_markers`) | done | measured, rayblaster `control-ui` r6, r12, r13, "The UI layer" |
 | Pause menu over a per-eye background, the menu at the screen plane (`ui_pause`) | done (`full`/`sbs`; `hsbs` too, from the side-by-side texture) | measured, rayblaster `control-ui` r12 (and r13 with 2x FG), "The UI layer" |
+| GfxGraph effects (Launch targeting outline, the Hiss barrier, Jesse's damage effect; Polaris and the video overlays by the same path) in both eyes | fixed (`gfxgraph_replay`, `gfxgraph_declare`) | measured, rayblaster `control-polaris` r2, r8-r10, "Left eye only: GfxGraph effects" |
 
 Cost: two world renders per displayed frame. Measured (`quiver lab gpu`, 10 s windows, r12):
 mono 81.4 / 61.2 presents/s, sbs 40.9 / 30.9 (two rounds; the ratio is 0.50 both times).
@@ -665,6 +666,8 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | dev: `history_mask` | 63 | per-eye sets: 1 graph persisted list, 2 DLF, 4 SSAO pairs, 8 volumetric, 16 TAA ring, 32 the RT reflection filter's output history (only with 2). All on: measured best (r38) |
 | dev: `graph_cross` | 0 | with bit 1: per-eye lists, but entry content copied from the other eye's latest (1 `lineardepthcopy`, 2 `colorBufferCopy-2`); bisecting only |
 | dev: `as_once` | 21 | mask: **16 the right eye shares the left eye's acceleration structures** ("Shared acceleration structures": its RT scene update and AS work are skipped; level changes stay in 3D); without 16 (or if its hooks don't match): 1 the right eye's AS job skips the build/compaction entries the left eye's job ran in this pair, 4 it still runs the build entries only it has, 8 also those compactions, 2 also skips its refit list; 0 runs everything twice. The right eye's job is the pair's second, by order |
+| dev: `gfxgraph_replay` | 1 | the right eye re-records the left eye's GfxGraph render-to-pass and particle commands (0 = they draw in the left eye only). Live |
+| dev: `gfxgraph_declare` | 1 | the right eye's graph re-declares the left eye's GfxGraph commands (offscreen passes: outlines); 2 without swaps and compute dispatches (untested); 0 off. Live |
 | dev: `load_mono` | 1 (inert with `as_once` 16) | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
@@ -801,6 +804,63 @@ dead-letters for 25 s and more), the pairs now advance through every teleport st
 per 25 s step). Not measured: the cost or benefit in frame time of skipping the right eye's RT
 update and AS work (expected to save CPU and GPU time, as nothing RT-related runs twice now).
 
+
+## Left eye only: GfxGraph effects (fixed, `gfxgraph_replay`, `gfxgraph_declare`)
+
+Reported from play on HypXRland (main 5324374, the mission "Unknown Caller"): Polaris, the Hiss
+enemies' "steam" (damage / cloak effects), the Launch targeting outline and the video overlays of
+Trench and others render in the left eye only.
+
+**Cause (static, renderer; confirmed live).** These are GfxGraph effects: node graphs that game
+entities run (`coregame::GfxGraphComponent`, `coreshared::GfxGraph*Node`), which hand the renderer
+commands once per game update through `rend::GfxGraphEngineWrapper`. `rend::GfxGraphEngine`
+(instance renderer+0x802898) keeps three r::Vectors that the render thread fills from
+RendererThreading messages (handlers renderer+0x4a640 / +0x4a6f0 / +0x4a7c0):
+
+| list | holds | consumed by (once per world render) |
+|---|---|---|
+| +0x28 | every command of the update: resource alloc / free, clears, render-to-texture (with draw-objects / mesh / quad / particle draws), compute dispatches, swaps, render-to-pass | renderer+0x4ea30, called at the end of the world graph build (renderer+0x1237c9 in the build 0x11ee20): declares each into the graph (vtable +8, OrderSolver renderer+0x910ba0), calls its `clear` (+0x18: resets the resource handles' last-writer links), **sets the count to 0**, then starts the video streamers of GfxGraph textures used this frame |
+| +0x38 | render-to-pass commands | renderer+0x4eb80 ("GfxGraphEngine" event), from the pass renderer+0x13e3a0 after the particles' light pass, the flares and the decals: appends each command's draws to the render's buckets (`GfxGraphRenderToPassCommand::recordCommands`), **then sets the count to 0** |
+| +0x48 | particle-system commands | the same function: `ParticleEngine::recordCommandsForLightPass` per command, **then count 0** |
+
+The engine's frame-end handler (renderer+0x4ed40) also zeroes +0x30 and +0x40; the commands live in
+the game-frame allocator until frame end, so they are still valid during the second render of the
+update. So the left eye's render used up all three lists and the right eye's found them empty: no
+offscreen GfxGraph work in its graph and none of the effects' draws.
+
+Live (rayblaster `control-polaris` r2, Dead Letters, with the replays off = main's behaviour): over
+~3 s the left eye's pass recorded 205 render-to-pass and 205 particle commands, the right eye's 0 and
+0; the pass runs once per eye (844 / 843 calls). With the declare replay on, every pair re-declares
+the left eye's list: in the hub (r10, 11055 pairs) per pair ~2.7 render-to-texture, 1.9 alloc / free,
+1 clear, 0.3 render-to-pass and 0.4 compute commands, no swaps.
+
+**Fix.** Two hooks (signature-checked; engine.h `kRvaGfxGraphRecord`, `kRvaGfxGraphDeclare`): in the
+left eye each keeps a copy of its list(s) before the engine empties them; in the right eye, if the
+list is empty, the copy is written back (within the vector's capacity, else counted as `cap_short`)
+and the engine's own function runs on it. Outside side-by-side pairs both are pass-throughs. Dev
+switches, live: `[stereo] gfxgraph_replay` (0 = main's behaviour for +0x38 / +0x48) and
+`gfxgraph_declare` (0 off, 1 all, 2 all but swaps and compute dispatches; 2 was not tested). Counters:
+`stereo status` `gfx` (per phase calls / commands, `replays`, `decl_replays`, command kinds).
+
+**Verified (rayblaster `control-polaris`, the user's renderer.ini: DLSS, all RT; the user's own saves
+as fixtures `unknown-caller` and `after-hotline`; separation 0 makes the two eyes' images identical,
+so |L-R| shows what one eye lacks; `re/scripts/stereo_lr.py`):**
+
+| effect | main's behaviour (replays off) | fix | how |
+|---|---|---|---|
+| The Hiss barrier (red wall, cafeteria) | pixels with \|L-R\| > 12/255: 3354, 11786; the right eye's barrier plain red without its structure | **0, 0**; at 32.5 mm the barrier's disparity in the right eye matches the left's: -22 px, mean \|diff\| 2.28 (6.31 off) | measured, r2 (record replay only; that effect needs no offscreen pass) |
+| Launch / aim targeting outline (white outline on the chair under the reticle, cafeteria fight) | 3836-4408 px, the outline in the left eye only (r9, 7 and 3 captures) | **0** (r9 8 captures, r10 6 captures); at 32.5 mm the right eye's outline follows the chair in that eye (crop `st_k_chair.png`) | measured, r8-r10; needs the declare replay: with only the record replay (and an RT-object restamp tried on the way, dropped) the outline stayed left-only (r6, `ch3`) |
+| Jesse's damage effect (red vignette with ink-like distortion) | mean \|L-R\| 17.8/255, 938k px: the right eye's vignette plain (r9 `s1_v0_3`) | identical (r8 `ol`, r10 combat frames: \|L-R\| 0.02-0.2, residue in dust and smoke) | measured |
+| Hiss enemies' effects | the white "steam" next to an enemy was in both eyes even with the replays off (r9 `f1`, `s1`), so it is not a GfxGraph effect; no damage/cloak effect on an enemy was captured | the fight's frames match between the eyes (r10 `s3`) | live, partial |
+| Polaris | not found on screen in the lab (both saves; GfxGraph lists were non-empty at Dead Letters and the cafeteria) | | not reproduced |
+| Video overlays (Trench, the Board) | not reached (story scenes) | | static only: 0x4ea30 starts the video streamers of textures GfxGraph commands use, i.e. GfxGraph effects play videos; the lobby's world video source (`stereo status` `video.active` 1) shows no \|L-R\| with `video_once` on (r10), so the right eye's skipped decode is not what blanks a video |
+
+No GPU fault (no Xid in the kernel log over r6-r10, many teleports and deaths in the fight).
+
+**Open.** Compute dispatches in the declared list now run once per eye, i.e. twice per update; if a
+GfxGraph effect simulates in a compute pass it advances twice per update in 3D (dust and smoke in the
+fight differ slightly between the eyes, \|L-R\| 0.13-0.36 mean in those regions; not further
+measured). Polaris and the video overlays are covered by the same mechanism but were not seen live.
 
 ## Level-change hang (`as_once`) and the open in-world RT fault
 
@@ -1084,50 +1144,6 @@ waits never satisfied as `STUCK`.
   move with it. HDR not tested with either. The
   surface probe is 3 HUD passes old (a fast turn can use a stale surface for a few frames).
   HypXRland not tested (the user's display).
-
-### Resume notes: left-eye-only effects (2026-11-23, branch `wip/stereo-polaris`, UNVERIFIED for merge)
-
-User reports (HypXRland, main 5324374): Polaris, the Hiss enemies' damage/cloak "steam", the Launch
-targeting outlines and the Trench/Board video overlays render in the left eye only.
-
-- **Cause found (GfxGraph effects; static + live).** `rend::GfxGraphEngine` (instance
-  renderer+0x802898) keeps +0x38 render-to-pass commands and +0x48 particle-system commands, filled
-  once per update on the render thread by RendererThreading messages (handlers renderer+0x4a6f0 /
-  +0x4a7c0). Each world render's pass renderer+0x13e3a0 calls renderer+0x4eb80 ("GfxGraphEngine"
-  event), which records both lists into that render's draw buckets and then sets both counts to 0
-  (static). So the right eye found them empty. Live (rayblaster `control-polaris` r2, new counters
-  `gfx` in `stereo status`): Dead Letters, replay off: per ~3 s, left 205 commands / 205 particle
-  commands, right **0 / 0**; the pass itself runs once per eye (calls 844 / 843).
-- **Fix (in this branch):** hook renderer+0x4eb80 (signature-checked, engine.h
-  `kRvaGfxGraphRecord`); the left eye's lists are kept and written back for the right eye (the
-  commands live in the game-frame allocator until frame end). Dev switch `[stereo] gfxgraph_replay`
-  (live, default 1).
-- **Verified so far (live, measured, r2):** cafeteria, the red Hiss barrier (a GfxGraph effect):
-  separation 0, |L-R| pixels > 12/255 in the barrier: replay off 3354 and 11786 (two captures),
-  replay on **0 and 0**; at 32.5 mm the barrier in the right eye matches the left at -22 px with
-  mean |diff| 2.28 (off: 6.31); the planter in front -17 px both ways. Captures:
-  `~/.cache/quiver/remote/rayblaster/lab/instances/control-polaris/lab/runs/r2/stereo_*_cafw_*`,
-  `*_cafs_*` (and `cafs_on_pair.png` / `cafs_off_pair.png` crops). No GPU fault seen.
-- **Not yet verified:** Polaris itself (not located on screen; the GfxGraph lists were non-empty at
-  Dead Letters and the cafeteria only), Hiss enemy VFX in combat, Launch outlines, video overlays.
-- **Outlines:** the "ObjectHighlight - Execute" pass (renderer+0x9fa20, called from +0x13ecf0)
-  draws the bucket at render-internal+0x300 into its own texture with the current view; whether that
-  bucket is filled by GfxGraph render-to-pass commands (then fixed too) or by a consumed per-update
-  list is open. Test: Launch aimed at a throwable (key binding not established; the save is before
-  the Hotline, Launch may not be unlocked yet).
-- **Video overlays:** `hk_videoUpdate` skips the right eye's `VideoStreamerFactory::updateAsync`
-  (video_once). `VideoStreamer::sample` (renderer+0x17c780) uploads Bink planes into a buffer ring
-  (`this+0x184`) and converts in FUN_18017d3d0; if the output is per render, the skip could blank the
-  right eye. This branch adds `stereo status` `video` {active sources, VideoLocation mask} to find a
-  world video (live survey: `entry-lobby` has 1 active source; directors-office, executive-corridor, upper-offices, mail-room, hotline-chamber 0); then A/B `stereo.video_once = 0` in the entry lobby. It may also be a GfxGraph effect (then fixed).
-- **Lab.** rayblaster instance `control-polaris` (1920x1080, GE-Proton11-12-x86_64, the user's
-  renderer.ini, `reload_pattern`/`log_file` set). Fixture `unknown-caller` = the user's save copied
-  read-only (Unknown Caller, "Enter the Communications Dept."). Launch with `tools/lab/continue
-  control-polaris --mod DIR` (DIR from `tools/lab/moddir DIR stereo.mode=sbs stereo.output=full
-  stereo.ui_pause=0`). Hub locations with GfxGraph activity: `dead-letters`, `cafeteria` (the barrier
-  is ~300 px left of the start view after turning 5x60 degrees right).
-- **Next.** Find Polaris / Hiss in combat / Launch / a world video; A/B each with `gfxgraph_replay`
-  (and `video_once`) at separation 0 (|L-R|) and 32.5 mm; then document, merge to main, push.
 
 ### Resume notes: the pause freeze fix (2026-11-24, merged)
 
