@@ -180,21 +180,6 @@ constexpr size_t kGfxEngRenderToPass = 0x38;  // then +0x48, 0x10 bytes apart
 constexpr uintptr_t kRvaGfxGraphDeclare = 0x4ea30;
 constexpr char kSigGfxGraphDeclare[] = "48 89 54 24 10 57 48 83 ec 30 48 c7 44 24 20 fe ff ff ff 48 89 5c 24 40";
 constexpr size_t kGfxEngAll = 0x28;
-// int* to a counter: the object highlight bucket (renderer+0x1c2af0) takes only highlighted objects
-// whose +0xe0 stamp equals it (diagnostics: read at the GfxGraph pass per eye).
-constexpr uintptr_t kRvaVisCounterPtr = 0x802950;
-// The per-object render update (renderer+0x1c7c30, static): exchanges Object +0xe0 with the current
-// render counter (*renderer+0x802950, one tick per world render: live, left 1854 / right 1855) and, on a
-// change, refreshes the object's per-render data. Called by the mesh record, the highlight bucket and
-// the RT scene update (call at renderer+0xa8793, once per listed RT instance's object).
-constexpr uintptr_t kRvaObjRenderUpdate = 0x1c7c30;
-constexpr char kSigObjRenderUpdate[] = "48 89 5c 24 10 48 89 7c 24 18 55 48 8d 6c 24 a9 48 81 ec b0 00 00 00";
-constexpr uintptr_t kRvaObjUpdateRtCall = 0xa8793;
-// Highlighted objects (Object::enableObjectHighlight): r::Vector of {Object*, float4 colour} at
-// renderer+0x91dae8 (count +8). The bucket filler renderer+0x1c2af0 (from the pass 0x13e4e0) draws an
-// entry only if Object +0xe0 equals the render counter.
-constexpr uintptr_t kRvaHighlightList = 0x91dae8;
-constexpr uintptr_t kRvaHighlightFill = 0x1c2af0;
 
 // "rtd:Enable async build" (bool tweakable value, default 1; static: its constructor renderer+0x3b10):
 // with it the RT acceleration structures are built by a job on the async compute queue, fenced
