@@ -54,8 +54,12 @@ bool ui_pause_sbs();
 // Around renderHUD's original call. sbs: the duplication is armed (eye width w).
 void ui_hud_begin(bool sbs, int w);
 void ui_hud_end();
-// A stereo pair was rendered (the pause background ends) / the level changes.
+// A world render (the pause background ends) / a load.
 void ui_pair_rendered();
+void ui_pause_cancel(const char* why);
+// The pause branch of renderHUD, before the HUD pass, at the side-by-side texture: takes both eyes
+// after a capture, then puts them into the texture each paused frame. False: render the frame mono.
+bool ui_pause_prepare(void* r, void* sbs_native, int w, int h);
 // [stereo] ui_markers / ui_pause (live), from stereo.cpp's config listener.
 void ui_option(const std::string& id, const std::string& v);
 std::string ui_status();

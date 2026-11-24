@@ -78,15 +78,6 @@ constexpr char kExpRtFree[] = "?free@RenderTargetManager@rend@@QEAAXPEAVTexture2
 constexpr char kSigAllocTexture2D[] = "48 8b c4 55 41 54 41 55 41 56 41 57 48 8d 6c 24 90 48 81 ec 70 01 00 00";
 constexpr char kSigRtFree[] = "40 56 57 41 56 48 83 ec 30 48 c7 44 24 20 fe ff ff ff 48 89 5c 24 58 48";
 constexpr uintptr_t kRvaRtManager = 0x8028d8;  // rend::RenderTargetManager* (what `end` frees with)
-// renderHUD's depth-stencil: the scene depth (+0x3a8) when it matches the colour target, else a pool
-// allocation "RendererX86::pHudDepthStencil", cleared (depth 1, stencil 0) only together with a colour
-// target renderHUD created (static, renderer 0x1343b0). A 2W side-by-side target always gets a pool
-// one; with stale stencil the pause menu's (stencil-clipped) Coherent layers drew nothing (live).
-constexpr char kExpAllocDepth[] =
-    "?allocDepthBuffer@RenderTargetManager@rend@@QEAAPEAVDepthBuffer@d3d@@AEBVDepthBufferInit@4@PEBD@Z";
-constexpr char kSigAllocDepth[] = "48 8b c4 56 57 41 56 48 83 ec 60 48 c7 40 a8 fe ff ff ff 48 89 58 10 48";
-constexpr char kExpClearDS[] = "?clearDepthStencil@DeviceUtil@d3d@@SAXAEAVDeviceState@2@PEAVNativeTexture@2@MEH@Z";
-constexpr char kSigClearDS[] = "48 8b c4 41 54 41 56 41 57 48 83 ec 60 48 c7 40 c8 fe ff ff ff 48 89 58";
 
 // --- d3d_rmdwin10_f.dll -------------------------------------------------------------------------
 constexpr char kExpGetAutoBackBuffer[] = "?getAutoBackBuffer@DeviceUtil@d3d@@SAPEAVNativeTexture@2@XZ";

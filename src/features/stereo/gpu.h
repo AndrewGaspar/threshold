@@ -61,6 +61,7 @@ struct DupDraw {
   float vp_x = 0, vp_y = 0, vp_w = 0, vp_h = 0;  // the viewport as the engine set it
   int dx = 0;                                    // the duplicate's offset (0: observing only)
   float shift[2] = {0, 0};
+  bool skip = false;  // phase 0: the draw is not issued at all (neither half)
 };
 using DupCb = void (*)(ID3D12GraphicsCommandList* cl, int phase, DupDraw& d);
 void gpu_dup_callback(DupCb cb);

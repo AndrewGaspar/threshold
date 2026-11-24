@@ -187,6 +187,29 @@ void* sbs_texture(void* r, void* cc) {
   return g_sbs;
 }
 
+// Frames without a pair (menus, videos, loads) are duplicated into a second 2W texture of the same
+// kind, so the side-by-side texture keeps the last pair (the pause background takes both eyes from
+// it, ui.cpp: a mono frame between the last pair and the capture had made it the mono image).
+void* g_mono = nullptr;
+int g_mono_w = 0, g_mono_h = 0, g_mono_fmt = -1;
+void* mono_texture(void* r, void* cc) {
+  if (!cc || !g_tex2d_init || !g_rt_alloc) return nullptr;
+  int w = rglob<int>(kRvaOutputSize), h = rglob<int>(kRvaOutputSize + 4);
+  int fmt = at<int8_t>(cc, kNtPixelFormat);
+  if (g_mono && g_mono_w == 2 * w && g_mono_h == h && g_mono_fmt == fmt) return g_mono;
+  void* mgr = at<void*>(r, kRRtManager);
+  if (!mgr) return nullptr;
+  if (g_mono && g_rt_free) g_rt_free(*reinterpret_cast<void**>(g_rimg.at(kRvaRtManager)), g_mono);
+  g_mono = nullptr;
+  alignas(16) uint8_t init[kTexture2DInitSize + 0x20] = {};
+  alignas(16) float clear[4] = {0, 0, 0, 0};
+  g_tex2d_init(init, 2 * w, h, 1, fmt, 5, 0, nullptr, 0, 0, 0, 0.5f, 1, clear, -1);
+  g_mono = g_rt_alloc(mgr, init, "Threshold::stereoMonoDuplicate");
+  g_mono_w = 2 * w, g_mono_h = h, g_mono_fmt = fmt;
+  TH_LOG("stereo: mono duplicate texture %dx%d format %d: %p", 2 * w, h, fmt, g_mono);
+  return g_mono;
+}
+
 // --- visibility results reused by the right eye (engine.h kRvaVisReady) ---------------------------
 using Pop_t = void*(__fastcall*)(void* q);
 using Push_t = void(__fastcall*)(void* q, void* v);
@@ -977,6 +1000,7 @@ void render_eye(void* r, const void* view, void* a3, void* a4, void* a5, const P
 
 void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, void* a5) {
   g_renderer = r;
+  ui_pair_rendered();  // any world render: the pause background (ui.cpp) ends
   g_n_worlds++;
   int nth = g_worlds_this_frame++;
   Params p = params();
@@ -1067,7 +1091,6 @@ void __fastcall hk_renderWorld(void* r, const void* view, void* a3, void* a4, vo
   uf.render_w = rglob<int>(kRvaRenderSize), uf.render_h = rglob<int>(kRvaRenderSize + 4);
   uf.sbs_native = g_sbs ? gpu_native(g_sbs) : nullptr;
   ui_frame(uf);
-  ui_pair_rendered();
 }
 
 // HDR: renderHUD paints the UI into a separate target ("RendererX86::pSeparateHudColorTarget", RGBA8,
@@ -1097,23 +1120,6 @@ void* __fastcall hk_rt_alloc(void* mgr, const void* init, const char* name) {
   return o_rt_alloc(mgr, init, name);
 }
 
-// The HUD depth-stencil of a side-by-side renderHUD (engine.h kExpAllocDepth): cleared like the
-// engine clears its own (depth 1, stencil 0) right after renderHUD allocates it.
-using AllocDepth_t = void*(__fastcall*)(void* mgr, const void* init, const char* name);
-using ClearDS_t = void(__cdecl*)(void* ds, void* nt, float depth, uint8_t stencil, int flags);
-AllocDepth_t o_alloc_depth;
-ClearDS_t g_clear_ds;
-std::atomic<bool> g_hud_ds_clear{false};
-std::atomic<uint64_t> g_n_hud_ds_clear{0};
-void* __fastcall hk_alloc_depth(void* mgr, const void* init, const char* name) {
-  void* d = o_alloc_depth(mgr, init, name);
-  if (d && g_hud_ds_clear.load(std::memory_order_relaxed) && name && strcmp(name, "RendererX86::pHudDepthStencil") == 0) {
-    void* nt = *reinterpret_cast<void**>(d);
-    if (nt) g_clear_ds(g_retrieve_ds(), nt, 1.0f, 0, 6), g_n_hud_ds_clear++;
-  }
-  return d;
-}
-
 // The HUD of a side-by-side frame: the engine's HUD pass draws into the colour target (+0x3c8)
 // once per eye, and each eye + HUD is collected into its half of the side-by-side texture that
 // `end` then blits (hk_end).
@@ -1127,38 +1133,33 @@ void __fastcall hk_renderHUD(void* r) {
            where(reinterpret_cast<uintptr_t>(paint)).c_str());
   }
   if (!g_pair) {
-    if (engine_loading()) ui_pair_rendered();  // quit to menu, a load: the pause background ends
+    if (engine_loading()) ui_pause_cancel("a load");  // quit to menu, a load: the pause background ends
     if (!ui_pause_sbs() || !packed_now() || !gpu_ready() || params().mode != Mode::Sbs) {
       ui_hud_begin(false, rglob<int>(kRvaOutputSize));
       o_renderHUD(r);
       ui_hud_end();
       return;
     }
-    // The pause menu over a per-eye background (ui.cpp): the HUD pass runs over the side-by-side
-    // texture with every draw repeated in the right half, where the background draw samples the
-    // right eye's capture. `end` then blits it like a pair.
+    // The pause menu over a per-eye background (ui.cpp): the side-by-side texture is filled with
+    // the last pair (both eyes), the HUD pass runs over it with every draw repeated in the right half
+    // except the engine's own background quad, and `end` blits it like a pair.
     int w = rglob<int>(kRvaOutputSize), h = rglob<int>(kRvaOutputSize + 4);
     void* sbs = g_sbs;  // the pairs' side-by-side texture (the colour target's format)
-    if (cct || !sbs || g_sbs_w != 2 * w || g_sbs_h != h) {  // a colour target already set: leave it
+    if (cct || !sbs || g_sbs_w != 2 * w || g_sbs_h != h || !ui_pause_prepare(r, gpu_native(sbs), w, h)) {
+      if (!cct) ui_pause_cancel("no side-by-side texture or a colour target set");
       o_renderHUD(r);
       return;
     }
-    static const float black[4] = {0, 0, 0, 1};
-    g_clear_rt(g_retrieve_ds(), gpu_native(sbs), black);
     at<void*>(r, kRCreatedColor) = sbs;
-    uint8_t owned = at<uint8_t>(r, kRCreatedOwned);
     at<uint8_t>(r, kRCreatedOwned) = 0;
     gpu_dup_arm(w);
     if (o_rt_alloc && g_hud_wide_on.load()) g_hud_hdr_w = w;
     ui_hud_begin(true, w);
-    g_hud_ds_clear = true;
     o_renderHUD(r);
-    g_hud_ds_clear = false;
     ui_hud_end();
     g_hud_hdr_w = 0;
     gpu_dup_arm(0);
     // +0x3c8 stays the side-by-side texture (not owned): `end` blits it and clears it.
-    (void)owned;
     g_shift[0] = g_shift[1] = 0;
     g_n_pause_sbs++;
     g_composed = true;
@@ -1226,7 +1227,7 @@ void __fastcall hk_end(void* r) {
     return;
   }
   void* cc = gpu_native(cct);
-  void* sbs = sbs_texture(r, cc);
+  void* sbs = g_composed ? sbs_texture(r, cc) : mono_texture(r, cc);
   if (!sbs) {
     g_composed = false;
     o_end(r);
@@ -1378,7 +1379,7 @@ std::string status_json() {
            "{\"mode\":\"%s\",\"mode_setting\":\"%s\",\"output\":\"%s\",\"packed\":%s,\"disabled\":%s,"
            "\"separation_mm\":%.2f,\"convergence_m\":%.2f,\"swap\":%s,\"shift\":[%d,%d],\"m00\":%.4f,"
            "\"worlds\":%llu,\"pairs\":%llu,\"biased\":%llu,\"hud2\":%llu,\"hud_dup_draws\":%llu,\"dup\":%llu,\"mono_dup\":%llu,\"mono_fallback\":%llu,"
-           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"video\":{\"active\":%d,\"where\":%u},\"gfx\":{\"replay\":%d,\"calls\":[%llu,%llu,%llu],\"cmds\":[%llu,%llu,%llu],\"ps\":[%llu,%llu,%llu],\"replays\":%llu,\"cap_short\":%llu,\"viscount\":[%d,%d,%d],\"declare\":%d,\"decl\":[%llu,%llu,%llu],\"decl_replays\":%llu,\"decl_dropped\":%llu,\"kinds\":%s},\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"rt_restamped\":%llu,\"hl\":{\"objs\":[%llu,%llu,%llu],\"pass\":[%llu,%llu,%llu],\"rtupd_count\":[%d,%d,%d]},\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s,\"pause_sbs\":%llu,\"hud_ds_clear\":%llu,\"ui\":%s}",
+           "\"rand_rec\":%llu,\"rand_replay\":%llu,\"vis_reuse\":%llu,\"vis_held\":%llu,\"vis_miss\":%llu,\"video_skip\":%llu,\"video\":{\"active\":%d,\"where\":%u},\"gfx\":{\"replay\":%d,\"calls\":[%llu,%llu,%llu],\"cmds\":[%llu,%llu,%llu],\"ps\":[%llu,%llu,%llu],\"replays\":%llu,\"cap_short\":%llu,\"viscount\":[%d,%d,%d],\"declare\":%d,\"decl\":[%llu,%llu,%llu],\"decl_replays\":%llu,\"decl_dropped\":%llu,\"kinds\":%s},\"level_changes\":%llu,\"load_mono\":%llu,\"blas_builds\":%llu,\"as_skipped\":%llu,\"refit_skipped\":%llu,\"as_late\":%llu,\"as_extra\":%llu,\"as_new\":%llu,\"as_new_built\":%llu,\"rt_upd_skipped\":%llu,\"rt_restamped\":%llu,\"hl\":{\"objs\":[%llu,%llu,%llu],\"pass\":[%llu,%llu,%llu],\"rtupd_count\":[%d,%d,%d]},\"tlas_skipped\":%llu,\"left_builds\":%llu,\"left_compactions\":%llu,\"hud_wide\":%llu,\"created_color\":%llu,\"present\":%llu,\"display_stereo\":%d,\"gpu\":%s,\"eyestate\":%s,\"window\":%s,\"pause_sbs\":%llu,\"ui\":%s}",
            mode_name(p.mode), raw_mode.c_str(), g_output_now.c_str(), g_packed.load() ? "true" : "false",
            g_disabled.load() ? "true" : "false", p.separation_mm, p.convergence_m, p.swap ? "true" : "false",
            g_shift[0], g_shift[1], g_last_m00, (unsigned long long)g_n_worlds.load(),
@@ -1390,7 +1391,7 @@ std::string status_json() {
            (unsigned long long)g_n_created_color.load(),
            (unsigned long long)present_frame(), hypr_display_stereo(), gpu_status().c_str(),
            eyestate_status().c_str(), window_status().c_str(), (unsigned long long)g_n_pause_sbs.load(),
-           (unsigned long long)g_n_hud_ds_clear.load(), ui_status().c_str());
+           ui_status().c_str());
   return b;
 }
 
@@ -1657,11 +1658,6 @@ void stereo_start() {
   }
   eyestate_start(g_rimg);
   if (g_pack.load() != 0) {
-    void* ad = module_export(kRenderer, kExpAllocDepth, "stereo");
-    g_clear_ds = reinterpret_cast<ClearDS_t>(module_export(kD3D, kExpClearDS, "stereo"));
-    if (!ad || !g_clear_ds || !sig_match(ad, kSigAllocDepth) || !sig_match((void*)g_clear_ds, kSigClearDS) ||
-        !hook_fn(ad, (void*)hk_alloc_depth, (void**)&o_alloc_depth, "RenderTargetManager::allocDepthBuffer"))
-      TH_LOG("stereo: allocDepthBuffer/clearDepthStencil missing or signature mismatch: the HUD depth-stencil is not cleared");
     UiEngine ue;
     ue.copy_region = g_copy_region;
     ue.tex2d_init = g_tex2d_init;
