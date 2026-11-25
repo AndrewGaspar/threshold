@@ -732,6 +732,7 @@ off, 2x, 4x, off, 2x, 4x; spin ~3.5 px/ms):
 | dev: `as_once` | 21 | mask: **16 the right eye shares the left eye's acceleration structures** ("Shared acceleration structures": its RT scene update and AS work are skipped; level changes stay in 3D); without 16 (or if its hooks don't match): 1 the right eye's AS job skips the build/compaction entries the left eye's job ran in this pair, 4 it still runs the build entries only it has, 8 also those compactions, 2 also skips its refit list; 0 runs everything twice. The right eye's job is the pair's second, by order |
 | dev: `gfxgraph_replay` | 1 | the right eye re-records the left eye's GfxGraph render-to-pass and particle commands (0 = they draw in the left eye only). Live |
 | dev: `gfxgraph_declare` | 1 | the right eye's graph re-declares the left eye's GfxGraph commands (offscreen passes: outlines); 2 without swaps and compute dispatches (untested); 0 off. Live |
+| dev: `gfxgraph_eye_view` | 1 | GfxGraph draw-objects (the targeting outline's mask) drawn from the rendering eye instead of the centre camera. Live |
 | dev: `load_mono` | 1 (inert with `as_once` 16) | render mono (both halves) while the engine changes level (jump points, episode reloads, onIsLoading) and until BLAS-build bursts settle: with `as_once` 4 the right eye's new builds hung the first teleport (r41, r42) |
 | dev: `rt_async_build` | 1 | 0 = hold "rtd:Enable async build" and "rtd:Enable async upload" off while pairs render (did not fix the level-change hang) |
 | dev: `fence_trace` | 0 | start-up: trace the engine's GPU fence waits/signals; `stereo fences N` dumps them (level-change hang) |
@@ -914,7 +915,7 @@ so |L-R| shows what one eye lacks; `re/scripts/stereo_lr.py`):**
 | effect | main's behaviour (replays off) | fix | how |
 |---|---|---|---|
 | The Hiss barrier (red wall, cafeteria) | pixels with \|L-R\| > 12/255: 3354, 11786; the right eye's barrier plain red without its structure | **0, 0**; at 32.5 mm the barrier's disparity in the right eye matches the left's: -22 px, mean \|diff\| 2.28 (6.31 off) | measured, r2 (record replay only; that effect needs no offscreen pass) |
-| Launch / aim targeting outline (white outline on the chair under the reticle, cafeteria fight) | 3836-4408 px, the outline in the left eye only (r9, 7 and 3 captures) | **0** (r9 8 captures, r10 6 captures; the build merged with main dc0f24c, r13: 12 captures while firing, against 4176-4341 px in 8 of 12 with the replays off, r12); at 32.5 mm the right eye's outline follows the chair in that eye (crop `st_k_chair.png`) | measured, r8-r10; needs the declare replay: with only the record replay (and an RT-object restamp tried on the way, dropped) the outline stayed left-only (r6, `ch3`) |
+| Launch / aim targeting outline (white outline on the chair under the reticle, cafeteria fight) | 3836-4408 px, the outline in the left eye only (r9, 7 and 3 captures) | **0** (r9 8 captures, r10 6 captures; the build merged with main dc0f24c, r13: 12 captures while firing, against 4176-4341 px in 8 of 12 with the replays off, r12); at 32.5 mm it was drawn, but from the centre camera (a by-eye check missed it; measured and fixed below, "The targeting outline's position") | measured, r8-r10; needs the declare replay: with only the record replay (and an RT-object restamp tried on the way, dropped) the outline stayed left-only (r6, `ch3`) |
 | Jesse's damage effect (red vignette with ink-like distortion) | mean \|L-R\| 17.8/255, 938k px: the right eye's vignette plain (r9 `s1_v0_3`) | identical (r8 `ol`, r10 combat frames: \|L-R\| 0.02-0.2, residue in dust and smoke) | measured |
 | Hiss enemies' effects | the white "steam" next to an enemy was in both eyes even with the replays off (r9 `f1`, `s1`), so it is not a GfxGraph effect; no damage/cloak effect on an enemy was captured | the fight's frames match between the eyes (r10 `s3`) | live, partial |
 | Polaris | not found on screen in the lab (both saves; GfxGraph lists were non-empty at Dead Letters and the cafeteria) | | not reproduced |
@@ -928,6 +929,62 @@ No GPU fault (no Xid in the kernel log over r6-r13, many teleports and deaths in
 GfxGraph effect simulates in a compute pass it advances twice per update in 3D (dust and smoke in the
 fight differ slightly between the eyes, \|L-R\| 0.13-0.36 mean in those regions; not further
 measured). Polaris and the video overlays are covered by the same mechanism but were not seen live.
+
+### The v8 crash (fixed): a particle command's draw bucket replayed with the left render's entries
+
+The user's game (v8, main 8c82317, sbs) faulted after ~8 min: `0xc0000005` at renderer+0x112ef3,
+reading address -1, stack (innermost first) renderer+0x112e50 <- `GfxGraphDrawParticleSystemsCommand::execute`
+(0x4e560) <- `GfxGraphRenderToTextureCommand::execute` (0x4c980) <- the graph executor (0xa07e0,
+0xa09a0, 0xa03c0) <- the world graph build (0x1237da, right after its GfxGraph declare call).
+
+Static: a `GfxGraphDrawParticleSystemsCommand` keeps its own draw bucket at +0x120 ({lookup map, list
+head +8, u32 count +0x10, u32 +0x20}). The GfxGraph pass (0x4eb80) fills it through
+`ParticleEngine::recordCommandsForLightPass` (the command's bucket in the context), pushing entries
+allocated from the recording thread's per-render scratch (0x112af0); the render-to-texture that holds
+the command draws it with 0x112e50, which walks the list (`rbx = [rbx + 0x10]`, the faulting read).
+The renderer empties the render context's buckets before every world render (0x125300: head, count,
++0x20 to 0, the map through 0x1126c0), but a command's own bucket only starts empty because the
+command is new each update. With the replays, the right eye's pass pushed its entries on top of the
+left eye's, whose scratch had been reused: a garbage link.
+
+Fix (branch `wip/stereo-gfx-crash`): before the right eye's replays, every particle command's bucket
+(those in the saved +0x48 list and those inside the replayed render-to-textures, by vtable
+renderer+0x623070) is emptied the renderer's way; and a saved list is replayed only in the pair it
+was saved in (a pair counter; `stale` in `stereo status` counts discarded lists). The GfxGraph hooks
+are installed only if the bucket reset matches too. Counter `bucket_resets`.
+
+Live (rayblaster `control-polaris`): the resets run in the cafeteria fight (876 in the first stress
+round, 1742 after the second), `stale` 0. Stress runs on the fixed builds: see the table below.
+
+### The targeting outline's position (fixed, `gfxgraph_eye_view`)
+
+Reported on v8 (sbs, 32.5 mm, convergence 4, FG off): the Launch targeting outline lined up in the
+left eye only. Measured (`re/scripts/stereo_outline.py`: the outline's disparity against its object's,
+and per eye the shift that puts the outline on the object's silhouette edges): the outline was drawn
+from the **centre** camera in both eyes, i.e. its disparity was the convergence shift alone
+(-22 px) at any depth, and each eye's outline was off by half the object's parallax, in opposite
+directions. My earlier "follows the chair" check (r9) was by eye on a chair near the convergence
+distance, where that error is small.
+
+Cause (static): `GfxGraphDrawObjectsCommand` (the outline's mask is drawn by one inside a
+render-to-texture) carries a world-to-view Matrix4x3 at +0x530 from its constructor, set on the game
+thread from the GfxGraph camera (the game's camera, between the eyes); its execute (0x4d8f0) composes
+each object's local-to-world (+0x70) with it into `g_mLocalToView`, so the mask ignores the eye's view.
+
+Fix: `GfxGraphDrawObjectsCommand::execute` hooked by export; while an eye renders, the matrix's
+translation x is moved by the eye's offset (view x -= offset, the same move `make_eye_view` makes to the
+render camera) for the draw and restored after. Dev switch `[stereo] gfxgraph_eye_view` (live).
+Counter `eye_view`.
+
+Measured (r15, r16; 32.5 mm, convergence 4, cafeteria fight, the outline on the aimed chair):
+
+| object | object disparity | outline disparity, centre view (main) | per eye outline -> object, main | outline disparity, fixed | per eye, fixed |
+|---|---|---|---|---|---|
+| chair ~5.5 m (r15, 2 captures each) | -6 px | -22 px | left +8, right -7 px | **-6 px** | +1, +1 px |
+| second chair (r15) | -7, -8 px | -22 px | +8 / -7, +1 / -2 px | **-6 px** | +1, +1 px |
+| farther chair ~9 m, behind a table (r16) | -12, -13 px | -22 px | +2, -2 px | **-13 px** | +1, +0 px |
+
+(+1 px is the metric's own offset: at 0 mm separation both eyes read +2 px, r8.)
 
 ## Level-change hang (`as_once`) and the open in-world RT fault
 
