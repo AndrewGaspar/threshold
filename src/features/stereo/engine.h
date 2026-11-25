@@ -180,6 +180,20 @@ constexpr size_t kGfxEngRenderToPass = 0x38;  // then +0x48, 0x10 bytes apart
 constexpr uintptr_t kRvaGfxGraphDeclare = 0x4ea30;
 constexpr char kSigGfxGraphDeclare[] = "48 89 54 24 10 57 48 83 ec 30 48 c7 44 24 20 fe ff ff ff 48 89 5c 24 40";
 constexpr size_t kGfxEngAll = 0x28;
+// GfxGraphDrawParticleSystemsCommand (vtable renderer+0x623070): its own draw bucket at +0x120, filled by
+// the GfxGraph pass (0x4eb80: ParticleEngine::recordCommandsForLightPass with the command's bucket in
+// the context) and drawn by its execute (0x4e560 -> 0x112e50, which walks the bucket's list). Entries
+// come from the recording thread's per-render scratch (0x112af0). Buckets are reset like the render
+// context's (renderer+0x125300): head +8, count +0x10, +0x20 to 0, map (+0) through 0x1126c0.
+constexpr uintptr_t kGfxVtDrawParticles = 0x623070;
+// GfxGraphDrawObjectsCommand: Matrix4x3 world-to-view at +0x530 (from its constructor's argument, set by
+// the game thread's GfxGraph nodes), composed with each object's local-to-world (+0x70) into
+// g_mLocalToView by its execute (0x4d8f0, static).
+constexpr size_t kGfxDrawObjView = 0x530;
+constexpr size_t kGfxPsBucket = 0x120;
+constexpr size_t kGfxRttDraws = 0x110, kGfxRttDrawCount = 0x220;  // GfxGraphRenderToTextureCommand
+constexpr uintptr_t kRvaBucketMapReset = 0x1126c0;
+constexpr char kSigBucketMapReset[] = "48 83 79 38 00 76 29 48 8b 41 58";
 
 // "rtd:Enable async build" (bool tweakable value, default 1; static: its constructor renderer+0x3b10):
 // with it the RT acceleration structures are built by a job on the async compute queue, fenced
