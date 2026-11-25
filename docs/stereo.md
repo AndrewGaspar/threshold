@@ -953,8 +953,18 @@ renderer+0x623070) is emptied the renderer's way; and a saved list is replayed o
 was saved in (a pair counter; `stale` in `stereo status` counts discarded lists). The GfxGraph hooks
 are installed only if the bucket reset matches too. Counter `bucket_resets`.
 
-Live (rayblaster `control-polaris`): the resets run in the cafeteria fight (876 in the first stress
-round, 1742 after the second), `stale` 0. Stress runs on the fixed builds: see the table below.
+Stress (rayblaster `control-polaris`, live; `stress.sh`-style rounds of: teleport into the cafeteria
+fight, Launch holds and bursts of fire (deaths and respawns most rounds), pause and resume, the
+collectibles menu, the map, teleports to Dead Letters, the Mail Room and the executive corridor):
+
+| build | rounds | pairs | right-eye replays (record / declare) | bucket resets | stale | result |
+|---|---|---|---|---|---|---|
+| crash fix only (r14) | 3 (2 effective; the third sat in the pause menu, the per-eye pause background on) | 10768 | 4438 / 10766 | 1742 | 0 | alive, no exception, no Xid |
+| crash fix + eye view (r16) | 10, 15 min | 63133 | 17370 / 63123 | 7239 | 0 | alive, no exception, no Xid |
+
+The v8 build was not run through the same stress to reproduce the fault (it took ~8 min of play on
+the user's machine); the cause is established statically from the faulting walk and the bucket's
+life cycle.
 
 ### The targeting outline's position (fixed, `gfxgraph_eye_view`)
 
